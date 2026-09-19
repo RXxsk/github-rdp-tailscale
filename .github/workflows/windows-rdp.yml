@@ -86,18 +86,98 @@ jobs:
       - name: Verify Tailscale and RDP
         shell: pwsh
         run: |
-          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          Write-Host "========================================"
+          Write-Host " VERIFICANDO TAILSCALE"
+          Write-Host "========================================"
+
+          $ipOutput = tailscale ip -4 2>&1
+
+          Write-Host "Salida de Tailscale:"
+          Write-Host $ipOutput
+
+          $ip = ($ipOutput |
+            Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
+            Select-Object -First 1).ToString().Trim()
+
           if ([string]::IsNullOrWhiteSpace($ip)) {
+            Write-Host "ERROR: No se obtuvo una IPv4 de Tailscale."
+            Write-Host ""
+            Write-Host "Estado de Tailscale:"
+            tailscale status
             throw "No se obtuvo una IPv4 de Tailscale."
           }
 
-          $tcp = Test-NetConnection -ComputerName '127.0.0.1' -Port 3389 -WarningAction SilentlyContinue
-          if (-not $tcp.TcpTestSucceeded) {
+          Write-Host "IPv4 de Tailscale detectada: $ip"
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host " VERIFICANDO SERVICIO RDP"
+          Write-Host "========================================"
+
+          $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+
+          if ($null -eq $rdpService) {
+            throw "No existe el servicio TermService."
+          }
+
+          Write-Host "Estado de TermService: $($rdpService.Status)"
+
+          if ($rdpService.Status -ne 'Running') {
+            Write-Host "Intentando iniciar TermService..."
+            Start-Service -Name TermService -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            $rdpService = Get-Service -Name TermService
+            Write-Host "Nuevo estado de TermService: $($rdpService.Status)"
+          }
+
+          Write-Host ""
+          Write-Host "Esperando a que RDP escuche en TCP 3389..."
+
+          $rdpReady = $false
+
+          for ($i = 1; $i -le 15; $i++) {
+            $tcp = Test-NetConnection `
+              -ComputerName '127.0.0.1' `
+              -Port 3389 `
+              -WarningAction SilentlyContinue
+
+            Write-Host "Intento $i/15 - TCP 3389: $($tcp.TcpTestSucceeded)"
+
+            if ($tcp.TcpTestSucceeded) {
+              $rdpReady = $true
+              break
+            }
+
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $rdpReady) {
+            Write-Host ""
+            Write-Host "ERROR: RDP no está escuchando en TCP 3389."
+            Write-Host ""
+            Write-Host "Conexiones TCP en escucha:"
+            Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+              Sort-Object LocalPort |
+              Format-Table -AutoSize
+
+            Write-Host ""
+            Write-Host "Reglas de Firewall RDP:"
+            Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+              Select-Object DisplayName, Enabled, Direction, Action |
+              Format-Table -AutoSize
+
             throw "RDP (TCP 3389) no está escuchando en el runner."
           }
 
+          Write-Host ""
+          Write-Host "RDP está escuchando correctamente en TCP 3389."
+
           $dns = $null
-          try { $dns = (tailscale dnsname 2>$null).Trim() } catch {}
+          try {
+            $dns = (tailscale dnsname 2>$null).Trim()
+          } catch {
+            $dns = ""
+          }
 
           "TAILSCALE_IPV4=$ip" >> $env:GITHUB_ENV
           "TAILSCALE_DNS=$dns" >> $env:GITHUB_ENV
@@ -113,7 +193,9 @@ jobs:
 
           **Contraseña:** usa el valor del secret `RDP_PASSWORD` (no se muestra en logs).
 
-          En **Windows App**, agrega un PC usando la IPv4 de arriba. Tu teléfono/PC también debe estar conectado al mismo tailnet.
+          En **Windows App**, agrega un PC usando la IPv4 de arriba.
+
+          Tu teléfono/PC también debe estar conectado al mismo tailnet.
           "@
 
       - name: Keep session alive
