@@ -1,0 +1,134 @@
+name: Windows RDP + Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "Tiempo de la sesión RDP (5-330 minutos)"
+        required: true
+        default: "60"
+        type: string
+
+jobs:
+  rdp:
+    # GitHub-hosted Windows runner: temporary VM created for this job.
+    runs-on: windows-2025
+    timeout-minutes: 360
+
+    permissions:
+      id-token: write
+      contents: read
+
+    env:
+      RDP_USERNAME: rdpuser
+
+    steps:
+      - name: Configure RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $minutes = [int]"${{ inputs.duration_minutes }}"
+          if ($minutes -lt 5 -or $minutes -gt 330) {
+            throw "duration_minutes debe estar entre 5 y 330."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Falta el secret RDP_PASSWORD en Settings > Secrets and variables > Actions."
+          }
+
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $existing = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          if ($null -eq $existing) {
+            New-LocalUser -Name $env:RDP_USERNAME `
+              -Password $securePassword `
+              -AccountNeverExpires `
+              -PasswordNeverExpires `
+              -UserMayNotChangePassword `
+              -Description "Temporary GitHub Actions RDP user"
+          } else {
+            Set-LocalUser -Name $env:RDP_USERNAME -Password $securePassword
+            Enable-LocalUser -Name $env:RDP_USERNAME
+          }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          # Enable Remote Desktop and its Windows Firewall rules.
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Type DWord -Value 0
+
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Type DWord -Value 1
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+            Enable-NetFirewallRule -ErrorAction SilentlyContinue
+
+          if (-not (Get-NetFirewallRule -DisplayName 'GitHub RDP 3389' -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule -DisplayName 'GitHub RDP 3389' `
+              -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any |
+              Out-Null
+          }
+
+          # Keep the password out of logs.
+          Write-Output "RDP_USER=$env:RDP_USERNAME" >> $env:GITHUB_ENV
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+
+      - name: Verify Tailscale and RDP
+        shell: pwsh
+        run: |
+          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+            throw "No se obtuvo una IPv4 de Tailscale."
+          }
+
+          $tcp = Test-NetConnection -ComputerName '127.0.0.1' -Port 3389 -WarningAction SilentlyContinue
+          if (-not $tcp.TcpTestSucceeded) {
+            throw "RDP (TCP 3389) no está escuchando en el runner."
+          }
+
+          $dns = $null
+          try { $dns = (tailscale dnsname 2>$null).Trim() } catch {}
+
+          "TAILSCALE_IPV4=$ip" >> $env:GITHUB_ENV
+          "TAILSCALE_DNS=$dns" >> $env:GITHUB_ENV
+
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
+          ## Windows RDP listo
+
+          **PC / Tailscale IPv4:** `$ip:3389`
+
+          **Tailscale DNS:** `$dns`
+
+          **Usuario:** `$env:RDP_USERNAME`
+
+          **Contraseña:** usa el valor del secret `RDP_PASSWORD` (no se muestra en logs).
+
+          En **Windows App**, agrega un PC usando la IPv4 de arriba. Tu teléfono/PC también debe estar conectado al mismo tailnet.
+          "@
+
+      - name: Keep session alive
+        shell: pwsh
+        run: |
+          $minutes = [int]"${{ inputs.duration_minutes }}"
+          Write-Host "Sesión RDP activa durante $minutes minutos. Cancela el workflow para terminarla antes."
+          $deadline = (Get-Date).AddMinutes($minutes)
+
+          while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 30
+          }
+
+      - name: Session finished
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "La sesión terminó. GitHub destruirá el runner al finalizar el job."
