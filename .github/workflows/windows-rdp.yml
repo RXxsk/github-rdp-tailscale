@@ -29,6 +29,7 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $minutes = [int]"${{ inputs.duration_minutes }}"
+
           if ($minutes -lt 5 -or $minutes -gt 330) {
             throw "duration_minutes debe estar entre 5 y 330."
           }
@@ -38,38 +39,74 @@ jobs:
           }
 
           $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          $existing = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+
+          $existing = Get-LocalUser `
+            -Name $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
 
           if ($null -eq $existing) {
-            New-LocalUser -Name $env:RDP_USERNAME `
+            New-LocalUser `
+              -Name $env:RDP_USERNAME `
               -Password $securePassword `
               -AccountNeverExpires `
               -PasswordNeverExpires `
               -UserMayNotChangePassword `
               -Description "Temporary GitHub Actions RDP user"
-          } else {
-            Set-LocalUser -Name $env:RDP_USERNAME -Password $securePassword
-            Enable-LocalUser -Name $env:RDP_USERNAME
+          }
+          else {
+            Set-LocalUser `
+              -Name $env:RDP_USERNAME `
+              -Password $securePassword
+
+            Enable-LocalUser `
+              -Name $env:RDP_USERNAME
           }
 
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
 
-          # Enable Remote Desktop and its Windows Firewall rules.
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Type DWord -Value 0
+          # Enable Remote Desktop.
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Type DWord `
+            -Value 0
 
-          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' -Type DWord -Value 1
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Type DWord `
+            -Value 1
 
-          Set-Service -Name TermService -StartupType Automatic
-          Start-Service -Name TermService -ErrorAction SilentlyContinue
+          Set-Service `
+            -Name TermService `
+            -StartupType Automatic
 
-          Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
-            Enable-NetFirewallRule -ErrorAction SilentlyContinue
+          Start-Service `
+            -Name TermService `
+            -ErrorAction SilentlyContinue
 
-          if (-not (Get-NetFirewallRule -DisplayName 'GitHub RDP 3389' -ErrorAction SilentlyContinue)) {
-            New-NetFirewallRule -DisplayName 'GitHub RDP 3389' `
-              -Direction Inbound -Protocol TCP -LocalPort 3389 -Action Allow -Profile Any |
+          # Enable Windows Firewall rules for Remote Desktop.
+          Get-NetFirewallRule `
+            -DisplayGroup 'Remote Desktop' `
+            -ErrorAction SilentlyContinue |
+            Enable-NetFirewallRule `
+            -ErrorAction SilentlyContinue
+
+          # Additional RDP firewall rule.
+          if (-not (Get-NetFirewallRule `
+            -DisplayName 'GitHub RDP 3389' `
+            -ErrorAction SilentlyContinue)) {
+
+            New-NetFirewallRule `
+              -DisplayName 'GitHub RDP 3389' `
+              -Direction Inbound `
+              -Protocol TCP `
+              -LocalPort 3389 `
+              -Action Allow `
+              -Profile Any |
               Out-Null
           }
 
@@ -90,23 +127,36 @@ jobs:
           Write-Host " VERIFICANDO TAILSCALE"
           Write-Host "========================================"
 
-          $ipOutput = tailscale ip -4 2>&1
+          $ipOutput = @(tailscale ip -4 2>&1)
 
           Write-Host "Salida de Tailscale:"
-          Write-Host $ipOutput
+          $ipOutput | ForEach-Object {
+            Write-Host $_
+          }
 
-          $ip = ($ipOutput |
-            Where-Object { $_ -match '^\d{1,3}(\.\d{1,3}){3}$' } |
-            Select-Object -First 1).ToString().Trim()
+          # Buscar una IPv4 válida dentro de la salida.
+          $ip = $null
+
+          foreach ($line in $ipOutput) {
+            $text = "$line".Trim()
+
+            if ($text -match '^\d{1,3}(\.\d{1,3}){3}$') {
+              $ip = $text
+              break
+            }
+          }
 
           if ([string]::IsNullOrWhiteSpace($ip)) {
+            Write-Host ""
             Write-Host "ERROR: No se obtuvo una IPv4 de Tailscale."
             Write-Host ""
             Write-Host "Estado de Tailscale:"
             tailscale status
+
             throw "No se obtuvo una IPv4 de Tailscale."
           }
 
+          Write-Host ""
           Write-Host "IPv4 de Tailscale detectada: $ip"
 
           Write-Host ""
@@ -114,7 +164,9 @@ jobs:
           Write-Host " VERIFICANDO SERVICIO RDP"
           Write-Host "========================================"
 
-          $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+          $rdpService = Get-Service `
+            -Name TermService `
+            -ErrorAction SilentlyContinue
 
           if ($null -eq $rdpService) {
             throw "No existe el servicio TermService."
@@ -124,18 +176,28 @@ jobs:
 
           if ($rdpService.Status -ne 'Running') {
             Write-Host "Intentando iniciar TermService..."
-            Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+            Start-Service `
+              -Name TermService `
+              -ErrorAction SilentlyContinue
+
             Start-Sleep -Seconds 3
-            $rdpService = Get-Service -Name TermService
+
+            $rdpService = Get-Service `
+              -Name TermService
+
             Write-Host "Nuevo estado de TermService: $($rdpService.Status)"
           }
 
           Write-Host ""
-          Write-Host "Esperando a que RDP escuche en TCP 3389..."
+          Write-Host "========================================"
+          Write-Host " VERIFICANDO PUERTO RDP"
+          Write-Host "========================================"
 
           $rdpReady = $false
 
           for ($i = 1; $i -le 15; $i++) {
+
             $tcp = Test-NetConnection `
               -ComputerName '127.0.0.1' `
               -Port 3389 `
@@ -152,17 +214,25 @@ jobs:
           }
 
           if (-not $rdpReady) {
+
             Write-Host ""
             Write-Host "ERROR: RDP no está escuchando en TCP 3389."
+
             Write-Host ""
             Write-Host "Conexiones TCP en escucha:"
-            Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+
+            Get-NetTCPConnection `
+              -State Listen `
+              -ErrorAction SilentlyContinue |
               Sort-Object LocalPort |
               Format-Table -AutoSize
 
             Write-Host ""
             Write-Host "Reglas de Firewall RDP:"
-            Get-NetFirewallRule -DisplayGroup 'Remote Desktop' -ErrorAction SilentlyContinue |
+
+            Get-NetFirewallRule `
+              -DisplayGroup 'Remote Desktop' `
+              -ErrorAction SilentlyContinue |
               Select-Object DisplayName, Enabled, Direction, Action |
               Format-Table -AutoSize
 
@@ -172,37 +242,57 @@ jobs:
           Write-Host ""
           Write-Host "RDP está escuchando correctamente en TCP 3389."
 
-          $dns = $null
-          try {
-            $dns = (tailscale dnsname 2>$null).Trim()
-          } catch {
-            $dns = ""
-          }
-
+          # Guardar únicamente la IPv4 de Tailscale.
           "TAILSCALE_IPV4=$ip" >> $env:GITHUB_ENV
-          "TAILSCALE_DNS=$dns" >> $env:GITHUB_ENV
 
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value @"
+          # Crear resumen visible en GitHub Actions.
+          $summary = @"
           ## Windows RDP listo
 
-          **PC / Tailscale IPv4:** `$ip:3389`
+          **PC / Tailscale IPv4:** ${ip}:3389
 
-          **Tailscale DNS:** `$dns`
+          **Usuario:** $env:RDP_USERNAME
 
-          **Usuario:** `$env:RDP_USERNAME`
+          **Contraseña:** usa el valor del secret ``RDP_PASSWORD``.
 
-          **Contraseña:** usa el valor del secret `RDP_PASSWORD` (no se muestra en logs).
+          ### Conexión
 
-          En **Windows App**, agrega un PC usando la IPv4 de arriba.
+          En **Windows App**, agrega un PC usando:
 
-          Tu teléfono/PC también debe estar conectado al mismo tailnet.
+          `${ip}:3389`
+
+          Tu teléfono o PC también debe estar conectado al mismo tailnet.
+
+          ### Estado
+
+          - Tailscale: conectado
+          - IPv4: ${ip}
+          - RDP: TCP 3389 escuchando
+          - Usuario: $env:RDP_USERNAME
           "@
+
+          Add-Content `
+            -Path $env:GITHUB_STEP_SUMMARY `
+            -Value $summary
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host " RDP LISTO"
+          Write-Host "========================================"
+          Write-Host "Tailscale IPv4: $ip"
+          Write-Host "Dirección RDP: ${ip}:3389"
+          Write-Host "Usuario: $env:RDP_USERNAME"
+          Write-Host ""
+          Write-Host "VERIFICACIÓN COMPLETADA CORRECTAMENTE."
 
       - name: Keep session alive
         shell: pwsh
         run: |
           $minutes = [int]"${{ inputs.duration_minutes }}"
-          Write-Host "Sesión RDP activa durante $minutes minutos. Cancela el workflow para terminarla antes."
+
+          Write-Host "Sesión RDP activa durante $minutes minutos."
+          Write-Host "Cancela el workflow para terminarla antes."
+
           $deadline = (Get-Date).AddMinutes($minutes)
 
           while ((Get-Date) -lt $deadline) {
@@ -213,4 +303,5 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          Write-Host "La sesión terminó. GitHub destruirá el runner al finalizar el job."
+          Write-Host "La sesión terminó."
+          Write-Host "GitHub destruirá el runner al finalizar el job."
