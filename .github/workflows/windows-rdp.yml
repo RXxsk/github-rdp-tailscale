@@ -18,11 +18,19 @@ jobs:
     permissions:
       id-token: write
       contents: read
+      actions: read
 
     env:
-      RDP_USERNAME: rdpuser
+      RDP_USERNAME: Roxisk
+      PERSISTENT_DIR: C:\Persistent
+      BACKUP_DIR: C:\PersistentBackup
 
     steps:
+
+      # ============================================================
+      # 1. CONFIGURAR RDP
+      # ============================================================
+
       - name: Configure RDP
         shell: pwsh
         env:
@@ -38,22 +46,28 @@ jobs:
             throw "Falta el secret RDP_PASSWORD en Settings > Secrets and variables > Actions."
           }
 
-          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD `
+            -AsPlainText `
+            -Force
 
           $existing = Get-LocalUser `
             -Name $env:RDP_USERNAME `
             -ErrorAction SilentlyContinue
 
           if ($null -eq $existing) {
+
             New-LocalUser `
               -Name $env:RDP_USERNAME `
               -Password $securePassword `
               -AccountNeverExpires `
               -PasswordNeverExpires `
               -UserMayNotChangePassword `
-              -Description "Temporary GitHub Actions RDP user"
+              -Description "Temporary GitHub Actions RDP administrator"
+
           }
           else {
+
             Set-LocalUser `
               -Name $env:RDP_USERNAME `
               -Password $securePassword
@@ -62,12 +76,38 @@ jobs:
               -Name $env:RDP_USERNAME
           }
 
+          # ========================================================
+          # AGREGAR USUARIO A RDP
+          # ========================================================
+
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
             -Member $env:RDP_USERNAME `
             -ErrorAction SilentlyContinue
 
-          # Enable Remote Desktop.
+          # ========================================================
+          # AGREGAR USUARIO A ADMINISTRATORS
+          # ========================================================
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+          # ========================================================
+          # CREAR CARPETA DE PERSISTENCIA
+          # ========================================================
+
+          New-Item `
+            -ItemType Directory `
+            -Path $env:PERSISTENT_DIR `
+            -Force |
+            Out-Null
+
+          # ========================================================
+          # ACTIVAR REMOTE DESKTOP
+          # ========================================================
+
           Set-ItemProperty `
             -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' `
@@ -88,14 +128,16 @@ jobs:
             -Name TermService `
             -ErrorAction SilentlyContinue
 
-          # Enable Windows Firewall rules for Remote Desktop.
+          # ========================================================
+          # FIREWALL RDP
+          # ========================================================
+
           Get-NetFirewallRule `
             -DisplayGroup 'Remote Desktop' `
             -ErrorAction SilentlyContinue |
             Enable-NetFirewallRule `
             -ErrorAction SilentlyContinue
 
-          # Additional RDP firewall rule.
           if (-not (Get-NetFirewallRule `
             -DisplayName 'GitHub RDP 3389' `
             -ErrorAction SilentlyContinue)) {
@@ -110,8 +152,231 @@ jobs:
               Out-Null
           }
 
-          # Keep the password out of logs.
           Write-Output "RDP_USER=$env:RDP_USERNAME" >> $env:GITHUB_ENV
+
+      # ============================================================
+      # 2. BUSCAR EL ÚLTIMO RESPALDO
+      # ============================================================
+
+      - name: Find previous backup
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Write-Host "========================================"
+          Write-Host " BUSCANDO RESPALDO ANTERIOR"
+          Write-Host "========================================"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $env:BACKUP_DIR `
+            -Force |
+            Out-Null
+
+          $headers = @{
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github+json"
+            "X-GitHub-Api-Version" = "2022-11-28"
+          }
+
+          $repo = "${{ github.repository }}"
+
+          $runsUrl = "https://api.github.com/repos/$repo/actions/runs?status=success&per_page=20"
+
+          try {
+            $runs = Invoke-RestMethod `
+              -Uri $runsUrl `
+              -Headers $headers `
+              -Method Get
+
+            $previousRun = $runs.workflow_runs |
+              Where-Object {
+                $_.id -ne [int64]"${{ github.run_id }}" `
+                -and $_.name -eq "Windows RDP + Tailscale"
+              } |
+              Select-Object -First 1
+
+            if ($null -eq $previousRun) {
+              Write-Host "No existe una ejecución anterior válida."
+              "HAS_BACKUP=false" >> $env:GITHUB_ENV
+              exit 0
+            }
+
+            Write-Host "Ejecución anterior encontrada:"
+            Write-Host "Run ID: $($previousRun.id)"
+
+            $artifactsUrl = "https://api.github.com/repos/$repo/actions/runs/$($previousRun.id)/artifacts"
+
+            $artifacts = Invoke-RestMethod `
+              -Uri $artifactsUrl `
+              -Headers $headers `
+              -Method Get
+
+            $backup = $artifacts.artifacts |
+              Where-Object {
+                $_.name -eq "windows-user-data"
+                -and $_.expired -eq $false
+              } |
+              Select-Object -First 1
+
+            if ($null -eq $backup) {
+              Write-Host "No se encontró un respaldo válido."
+              "HAS_BACKUP=false" >> $env:GITHUB_ENV
+              exit 0
+            }
+
+            Write-Host "Respaldo encontrado."
+            Write-Host "Artifact ID: $($backup.id)"
+
+            $downloadUrl = "https://api.github.com/repos/$repo/actions/artifacts/$($backup.id)/zip"
+
+            $zipPath = Join-Path $env:BACKUP_DIR "windows-user-data.zip"
+
+            Invoke-WebRequest `
+              -Uri $downloadUrl `
+              -Headers $headers `
+              -OutFile $zipPath
+
+            Expand-Archive `
+              -Path $zipPath `
+              -DestinationPath $env:BACKUP_DIR `
+              -Force
+
+            "HAS_BACKUP=true" >> $env:GITHUB_ENV
+
+            Write-Host "Respaldo descargado correctamente."
+
+          }
+          catch {
+            Write-Host "No fue posible descargar un respaldo anterior."
+            Write-Host "La sesión continuará sin restauración."
+            Write-Host "Detalle: $($_.Exception.Message)"
+
+            "HAS_BACKUP=false" >> $env:GITHUB_ENV
+          }
+
+      # ============================================================
+      # 3. RESTAURAR ARCHIVOS Y CONFIGURACIONES
+      # ============================================================
+
+      - name: Restore persistent user data
+        if: env.HAS_BACKUP == 'true'
+        shell: pwsh
+        run: |
+          Write-Host "========================================"
+          Write-Host " RESTAURANDO DATOS"
+          Write-Host "========================================"
+
+          $profilePath = "C:\Users\$env:RDP_USERNAME"
+
+          if (-not (Test-Path $profilePath)) {
+            throw "No se encontró el perfil de usuario: $profilePath"
+          }
+
+          $backupProfile = Join-Path $env:BACKUP_DIR "Profile"
+
+          if (Test-Path $backupProfile) {
+
+            Write-Host "Restaurando carpetas personales..."
+
+            $folders = @(
+              "Desktop",
+              "Documents",
+              "Downloads",
+              "Pictures"
+            )
+
+            foreach ($folder in $folders) {
+
+              $source = Join-Path $backupProfile $folder
+              $destination = Join-Path $profilePath $folder
+
+              if (Test-Path $source) {
+
+                New-Item `
+                  -ItemType Directory `
+                  -Path $destination `
+                  -Force |
+                  Out-Null
+
+                Copy-Item `
+                  -Path "$source\*" `
+                  -Destination $destination `
+                  -Recurse `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+                Write-Host "Restaurado: $folder"
+              }
+            }
+          }
+
+          # ========================================================
+          # RESTAURAR FOTO DE CUENTA
+          # ========================================================
+
+          $accountPicturesSource = Join-Path `
+            $env:BACKUP_DIR `
+            "AccountPictures"
+
+          $accountPicturesDestination = Join-Path `
+            $profilePath `
+            "AppData\Roaming\Microsoft\Windows\AccountPictures"
+
+          if (Test-Path $accountPicturesSource) {
+
+            New-Item `
+              -ItemType Directory `
+              -Path $accountPicturesDestination `
+              -Force |
+              Out-Null
+
+            Copy-Item `
+              -Path "$accountPicturesSource\*" `
+              -Destination $accountPicturesDestination `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            Write-Host "Foto de cuenta restaurada."
+          }
+
+          # ========================================================
+          # RESTAURAR TEMAS DE WINDOWS
+          # ========================================================
+
+          $themesSource = Join-Path `
+            $env:BACKUP_DIR `
+            "Themes"
+
+          $themesDestination = Join-Path `
+            $profilePath `
+            "AppData\Local\Microsoft\Windows\Themes"
+
+          if (Test-Path $themesSource) {
+
+            New-Item `
+              -ItemType Directory `
+              -Path $themesDestination `
+              -Force |
+              Out-Null
+
+            Copy-Item `
+              -Path "$themesSource\*" `
+              -Destination $themesDestination `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            Write-Host "Temas de Windows restaurados."
+          }
+
+          Write-Host ""
+          Write-Host "RESTAURACIÓN COMPLETADA."
+
+      # ============================================================
+      # 4. CONECTAR TAILSCALE
+      # ============================================================
 
       - name: Connect runner to Tailscale
         uses: tailscale/github-action@v4
@@ -119,6 +384,10 @@ jobs:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           audience: ${{ secrets.TS_AUDIENCE }}
           tags: tag:ci
+
+      # ============================================================
+      # 5. VERIFICAR TAILSCALE Y RDP
+      # ============================================================
 
       - name: Verify Tailscale and RDP
         shell: pwsh
@@ -130,14 +399,15 @@ jobs:
           $ipOutput = @(tailscale ip -4 2>&1)
 
           Write-Host "Salida de Tailscale:"
+
           $ipOutput | ForEach-Object {
             Write-Host $_
           }
 
-          # Buscar una IPv4 válida dentro de la salida.
           $ip = $null
 
           foreach ($line in $ipOutput) {
+
             $text = "$line".Trim()
 
             if ($text -match '^\d{1,3}(\.\d{1,3}){3}$') {
@@ -147,10 +417,13 @@ jobs:
           }
 
           if ([string]::IsNullOrWhiteSpace($ip)) {
+
             Write-Host ""
             Write-Host "ERROR: No se obtuvo una IPv4 de Tailscale."
+
             Write-Host ""
             Write-Host "Estado de Tailscale:"
+
             tailscale status
 
             throw "No se obtuvo una IPv4 de Tailscale."
@@ -175,6 +448,7 @@ jobs:
           Write-Host "Estado de TermService: $($rdpService.Status)"
 
           if ($rdpService.Status -ne 'Running') {
+
             Write-Host "Intentando iniciar TermService..."
 
             Start-Service `
@@ -186,7 +460,7 @@ jobs:
             $rdpService = Get-Service `
               -Name TermService
 
-            Write-Host "Nuevo estado de TermService: $($rdpService.Status)"
+            Write-Host "Nuevo estado: $($rdpService.Status)"
           }
 
           Write-Host ""
@@ -206,6 +480,7 @@ jobs:
             Write-Host "Intento $i/15 - TCP 3389: $($tcp.TcpTestSucceeded)"
 
             if ($tcp.TcpTestSucceeded) {
+
               $rdpReady = $true
               break
             }
@@ -217,9 +492,6 @@ jobs:
 
             Write-Host ""
             Write-Host "ERROR: RDP no está escuchando en TCP 3389."
-
-            Write-Host ""
-            Write-Host "Conexiones TCP en escucha:"
 
             Get-NetTCPConnection `
               -State Listen `
@@ -240,12 +512,10 @@ jobs:
           }
 
           Write-Host ""
-          Write-Host "RDP está escuchando correctamente en TCP 3389."
+          Write-Host "RDP está escuchando correctamente."
 
-          # Guardar únicamente la IPv4 de Tailscale.
           "TAILSCALE_IPV4=$ip" >> $env:GITHUB_ENV
 
-          # Crear resumen visible en GitHub Actions.
           $summary = @"
           ## Windows RDP listo
 
@@ -257,7 +527,7 @@ jobs:
 
           ### Conexión
 
-          En **Windows App**, agrega un PC usando:
+          En **Windows App**, agrega:
 
           `${ip}:3389`
 
@@ -269,6 +539,8 @@ jobs:
           - IPv4: ${ip}
           - RDP: TCP 3389 escuchando
           - Usuario: $env:RDP_USERNAME
+          - Administrador: Sí
+          - Persistencia: habilitada
           "@
 
           Add-Content `
@@ -282,8 +554,13 @@ jobs:
           Write-Host "Tailscale IPv4: $ip"
           Write-Host "Dirección RDP: ${ip}:3389"
           Write-Host "Usuario: $env:RDP_USERNAME"
+          Write-Host "Administrador: Sí"
           Write-Host ""
           Write-Host "VERIFICACIÓN COMPLETADA CORRECTAMENTE."
+
+      # ============================================================
+      # 6. MANTENER LA SESIÓN
+      # ============================================================
 
       - name: Keep session alive
         shell: pwsh
@@ -299,9 +576,162 @@ jobs:
             Start-Sleep -Seconds 30
           }
 
+      # ============================================================
+      # 7. GUARDAR DATOS PERSISTENTES
+      # ============================================================
+
+      - name: Prepare persistent backup
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "========================================"
+          Write-Host " PREPARANDO RESPALDO"
+          Write-Host "========================================"
+
+          $profilePath = "C:\Users\$env:RDP_USERNAME"
+
+          if (-not (Test-Path $profilePath)) {
+            Write-Host "No se encontró el perfil. No hay datos para guardar."
+            exit 0
+          }
+
+          $backupRoot = "C:\PersistentBackup"
+          $backupProfile = Join-Path $backupRoot "Profile"
+
+          Remove-Item `
+            -Path $backupRoot `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue
+
+          New-Item `
+            -ItemType Directory `
+            -Path $backupProfile `
+            -Force |
+            Out-Null
+
+          # ========================================================
+          # GUARDAR CARPETAS PERSONALES
+          # ========================================================
+
+          $folders = @(
+            "Desktop",
+            "Documents",
+            "Downloads",
+            "Pictures"
+          )
+
+          foreach ($folder in $folders) {
+
+            $source = Join-Path $profilePath $folder
+            $destination = Join-Path $backupProfile $folder
+
+            if (Test-Path $source) {
+
+              New-Item `
+                -ItemType Directory `
+                -Path $destination `
+                -Force |
+                Out-Null
+
+              Copy-Item `
+                -Path "$source\*" `
+                -Destination $destination `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+
+              Write-Host "Guardado: $folder"
+            }
+          }
+
+          # ========================================================
+          # GUARDAR FOTO DE CUENTA
+          # ========================================================
+
+          $accountPicturesSource = Join-Path `
+            $profilePath `
+            "AppData\Roaming\Microsoft\Windows\AccountPictures"
+
+          $accountPicturesDestination = Join-Path `
+            $backupRoot `
+            "AccountPictures"
+
+          if (Test-Path $accountPicturesSource) {
+
+            New-Item `
+              -ItemType Directory `
+              -Path $accountPicturesDestination `
+              -Force |
+              Out-Null
+
+            Copy-Item `
+              -Path "$accountPicturesSource\*" `
+              -Destination $accountPicturesDestination `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            Write-Host "Foto de cuenta guardada."
+          }
+
+          # ========================================================
+          # GUARDAR TEMAS
+          # ========================================================
+
+          $themesSource = Join-Path `
+            $profilePath `
+            "AppData\Local\Microsoft\Windows\Themes"
+
+          $themesDestination = Join-Path `
+            $backupRoot `
+            "Themes"
+
+          if (Test-Path $themesSource) {
+
+            New-Item `
+              -ItemType Directory `
+              -Path $themesDestination `
+              -Force |
+              Out-Null
+
+            Copy-Item `
+              -Path "$themesSource\*" `
+              -Destination $themesDestination `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            Write-Host "Temas guardados."
+          }
+
+          Write-Host ""
+          Write-Host "RESPALDO PREPARADO CORRECTAMENTE."
+
+      # ============================================================
+      # 8. SUBIR RESPALDO A GITHUB
+      # ============================================================
+
+      - name: Upload persistent backup
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-user-data
+          path: C:\PersistentBackup
+          if-no-files-found: ignore
+          retention-days: 90
+          compression-level: 6
+
+      # ============================================================
+      # 9. FINAL
+      # ============================================================
+
       - name: Session finished
         if: always()
         shell: pwsh
         run: |
-          Write-Host "La sesión terminó."
-          Write-Host "GitHub destruirá el runner al finalizar el job."
+          Write-Host "========================================"
+          Write-Host " SESIÓN FINALIZADA"
+          Write-Host "========================================"
+          Write-Host "Los datos seleccionados fueron enviados al respaldo."
+          Write-Host "GitHub destruirá el runner temporal al finalizar el job."
