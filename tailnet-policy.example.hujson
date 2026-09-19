@@ -1,0 +1,14 @@
+{
+  // Sustituye el correo por la identidad de tu usuario en Tailscale.
+  // Este ejemplo solo permite RDP desde ese usuario hacia los runners tag:ci.
+  "grants": [
+    {
+      "src": ["tu-correo@ejemplo.com"],
+      "dst": ["tag:ci"],
+      "ip": ["3389"]
+    }
+  ],
+  "tagOwners": {
+    "tag:ci": ["autogroup:admin"]
+  }
+}
