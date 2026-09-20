@@ -275,6 +275,10 @@ jobs:
 
           $backupProfile = Join-Path $env:BACKUP_DIR "Profile"
 
+          # ========================================================
+          # RESTAURAR CARPETAS PERSONALES
+          # ========================================================
+
           if (Test-Path $backupProfile) {
 
             Write-Host "Restaurando carpetas personales..."
@@ -342,7 +346,7 @@ jobs:
           }
 
           # ========================================================
-          # RESTAURAR TEMAS DE WINDOWS
+          # RESTAURAR TEMAS LOCALES
           # ========================================================
 
           $themesSource = Join-Path `
@@ -368,7 +372,116 @@ jobs:
               -Force `
               -ErrorAction SilentlyContinue
 
-            Write-Host "Temas de Windows restaurados."
+            Write-Host "Temas locales restaurados."
+          }
+
+          # ========================================================
+          # RESTAURAR CACHÉ DEL WALLPAPER Y TEMAS
+          # ========================================================
+
+          $themeCacheSource = Join-Path `
+            $env:BACKUP_DIR `
+            "ThemeCache"
+
+          $themeCacheDestination = Join-Path `
+            $profilePath `
+            "AppData\Roaming\Microsoft\Windows\Themes"
+
+          if (Test-Path $themeCacheSource) {
+
+            New-Item `
+              -ItemType Directory `
+              -Path $themeCacheDestination `
+              -Force |
+              Out-Null
+
+            Copy-Item `
+              -Path "$themeCacheSource\*" `
+              -Destination $themeCacheDestination `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            Write-Host "Caché de temas/wallpaper restaurado."
+          }
+
+          # ========================================================
+          # RESTAURAR CONFIGURACIÓN DE PERSONALIZACIÓN
+          # ========================================================
+
+          $registryBackup = Join-Path `
+            $env:BACKUP_DIR `
+            "Registry"
+
+          $userHive = Join-Path `
+            $profilePath `
+            "NTUSER.DAT"
+
+          $hiveName = "RoxiskPersist"
+
+          if ((Test-Path $registryBackup) -and (Test-Path $userHive)) {
+
+            Write-Host ""
+            Write-Host "Restaurando configuración de Personalización..."
+
+            reg.exe unload "HKU\$hiveName" 2>$null | Out-Null
+
+            $loadResult = reg.exe load `
+              "HKU\$hiveName" `
+              "$userHive"
+
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "No fue posible cargar temporalmente el registro del usuario."
+            }
+            else {
+
+              $registryFiles = Get-ChildItem `
+                -Path $registryBackup `
+                -Filter "*.reg" `
+                -File `
+                -ErrorAction SilentlyContinue
+
+              foreach ($registryFile in $registryFiles) {
+
+                Write-Host "Restaurando registro: $($registryFile.Name)"
+
+                $content = Get-Content `
+                  -Path $registryFile.FullName `
+                  -Raw `
+                  -ErrorAction SilentlyContinue
+
+                if (-not [string]::IsNullOrWhiteSpace($content)) {
+
+                  $content = $content.Replace(
+                    "HKEY_CURRENT_USER",
+                    "HKEY_USERS\$hiveName"
+                  )
+
+                  $tempReg = Join-Path `
+                    $env:TEMP `
+                    ("restore-" + $registryFile.Name)
+
+                  Set-Content `
+                    -Path $tempReg `
+                    -Value $content `
+                    -Encoding Unicode
+
+                  reg.exe import $tempReg | Out-Null
+
+                  Remove-Item `
+                    -Path $tempReg `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+                }
+              }
+
+              reg.exe unload "HKU\$hiveName" 2>$null | Out-Null
+
+              Write-Host "Configuración de Personalización restaurada."
+            }
+          }
+          else {
+            Write-Host "No existe respaldo de registro de Personalización."
           }
 
           Write-Host ""
@@ -541,6 +654,7 @@ jobs:
           - Usuario: $env:RDP_USERNAME
           - Administrador: Sí
           - Persistencia: habilitada
+          - Personalización: habilitada
           "@
 
           Add-Content `
@@ -597,6 +711,7 @@ jobs:
 
           $backupRoot = "C:\PersistentBackup"
           $backupProfile = Join-Path $backupRoot "Profile"
+          $registryBackup = Join-Path $backupRoot "Registry"
 
           Remove-Item `
             -Path $backupRoot `
@@ -607,6 +722,12 @@ jobs:
           New-Item `
             -ItemType Directory `
             -Path $backupProfile `
+            -Force |
+            Out-Null
+
+          New-Item `
+            -ItemType Directory `
+            -Path $registryBackup `
             -Force |
             Out-Null
 
@@ -676,7 +797,7 @@ jobs:
           }
 
           # ========================================================
-          # GUARDAR TEMAS
+          # GUARDAR TEMAS LOCALES
           # ========================================================
 
           $themesSource = Join-Path `
@@ -702,11 +823,124 @@ jobs:
               -Force `
               -ErrorAction SilentlyContinue
 
-            Write-Host "Temas guardados."
+            Write-Host "Temas locales guardados."
+          }
+
+          # ========================================================
+          # GUARDAR CACHÉ DE WALLPAPER Y TEMAS
+          # ========================================================
+
+          $themeCacheSource = Join-Path `
+            $profilePath `
+            "AppData\Roaming\Microsoft\Windows\Themes"
+
+          $themeCacheDestination = Join-Path `
+            $backupRoot `
+            "ThemeCache"
+
+          if (Test-Path $themeCacheSource) {
+
+            New-Item `
+              -ItemType Directory `
+              -Path $themeCacheDestination `
+              -Force |
+              Out-Null
+
+            Copy-Item `
+              -Path "$themeCacheSource\*" `
+              -Destination $themeCacheDestination `
+              -Recurse `
+              -Force `
+              -ErrorAction SilentlyContinue
+
+            Write-Host "Caché de wallpaper/temas guardado."
+          }
+
+          # ========================================================
+          # GUARDAR CONFIGURACIÓN DE PERSONALIZACIÓN
+          # ========================================================
+
+          Write-Host ""
+          Write-Host "Guardando configuración de Personalización..."
+
+          $userHive = Join-Path `
+            $profilePath `
+            "NTUSER.DAT"
+
+          $hiveName = "RoxiskPersist"
+
+          if (Test-Path $userHive) {
+
+            # Asegurar que no exista un montaje anterior
+            reg.exe unload "HKU\$hiveName" 2>$null | Out-Null
+
+            $loadResult = reg.exe load `
+              "HKU\$hiveName" `
+              "$userHive"
+
+            if ($LASTEXITCODE -ne 0) {
+
+              Write-Host "No se pudo cargar NTUSER.DAT para guardar Personalización."
+
+            }
+            else {
+
+              # ====================================================
+              # CLAVES DE PERSONALIZACIÓN
+              # ====================================================
+
+              $registryKeys = @(
+                "Control Panel\Desktop",
+                "Software\Microsoft\Windows\CurrentVersion\Themes",
+                "Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
+                "Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers",
+                "Software\Microsoft\Windows\CurrentVersion\Explorer\Accent",
+                "Software\Microsoft\Windows\DWM"
+              )
+
+              foreach ($key in $registryKeys) {
+
+                $safeName = $key `
+                  -replace '[\\/:*?"<>|]', '_' `
+                  -replace ' ', '_'
+
+                $outputFile = Join-Path `
+                  $registryBackup `
+                  "$safeName.reg"
+
+                $sourceKey = "HKEY_USERS\$hiveName\$key"
+
+                Write-Host "Guardando registro: $key"
+
+                reg.exe export `
+                  "$sourceKey" `
+                  "$outputFile" `
+                  /y | Out-Null
+
+                if ($LASTEXITCODE -ne 0) {
+
+                  Remove-Item `
+                    -Path $outputFile `
+                    -Force `
+                    -ErrorAction SilentlyContinue
+
+                  Write-Host "No se pudo guardar: $key"
+                }
+              }
+
+              reg.exe unload "HKU\$hiveName" 2>$null | Out-Null
+
+              Write-Host "Configuración de Personalización guardada."
+            }
+          }
+          else {
+            Write-Host "No se encontró NTUSER.DAT."
           }
 
           Write-Host ""
-          Write-Host "RESPALDO PREPARADO CORRECTAMENTE."
+          Write-Host "========================================"
+          Write-Host " RESPALDO PREPARADO"
+          Write-Host "========================================"
 
       # ============================================================
       # 8. SUBIR RESPALDO A GITHUB
