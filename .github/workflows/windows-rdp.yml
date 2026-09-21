@@ -287,7 +287,7 @@ jobs:
         env:
           BACKUP_SOURCE: ${{ steps.previous-backup.outputs.path }}
         run: |
-          $ErrorActionPreference = "Continue"
+          $ErrorActionPreference = "Stop"
 
           Write-Host "========================================"
           Write-Host "RESTORING PERSISTENT DATA"
@@ -307,6 +307,43 @@ jobs:
             -Path $env:PERSISTENT_DIR `
             -Force |
             Out-Null
+
+          # --------------------------------------------------------
+          # ROBocopy helper
+          # Codes 0-7 are successful/non-fatal.
+          # Codes 8+ are real Robocopy errors.
+          # --------------------------------------------------------
+
+          function Copy-WithRobocopy {
+              param(
+                  [Parameter(Mandatory = $true)]
+                  [string]$SourcePath,
+
+                  [Parameter(Mandatory = $true)]
+                  [string]$DestinationPath
+              )
+
+              & robocopy `
+                $SourcePath `
+                $DestinationPath `
+                /E `
+                /COPY:DAT `
+                /DCOPY:DAT `
+                /R:1 `
+                /W:1 `
+                /XJ `
+                /NFL `
+                /NDL `
+                /NP
+
+              $code = $LASTEXITCODE
+
+              Write-Host "Robocopy exit code: $code"
+
+              if ($code -ge 8) {
+                  throw "Robocopy failed with exit code $code."
+              }
+          }
 
           # --------------------------------------------------------
           # PERSONAL FOLDERS
@@ -334,18 +371,9 @@ jobs:
                     -Force |
                     Out-Null
 
-                  robocopy `
-                    $src `
-                    $dst `
-                    /E `
-                    /COPY:DAT `
-                    /DCOPY:DAT `
-                    /R:1 `
-                    /W:1 `
-                    /XJ `
-                    /NFL `
-                    /NDL `
-                    /NP
+                  Copy-WithRobocopy `
+                    -SourcePath $src `
+                    -DestinationPath $dst
               }
           }
 
@@ -371,18 +399,9 @@ jobs:
                 -Force |
                 Out-Null
 
-              robocopy `
-                $accountPicturesSource `
-                $accountPicturesDestination `
-                /E `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL `
-                /NP
+              Copy-WithRobocopy `
+                -SourcePath $accountPicturesSource `
+                -DestinationPath $accountPicturesDestination
           }
 
           # --------------------------------------------------------
@@ -407,18 +426,9 @@ jobs:
                 -Force |
                 Out-Null
 
-              robocopy `
-                $themeSource `
-                $themeDestination `
-                /E `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL `
-                /NP
+              Copy-WithRobocopy `
+                -SourcePath $themeSource `
+                -DestinationPath $themeDestination
           }
 
           # --------------------------------------------------------
@@ -443,18 +453,9 @@ jobs:
                 -Force |
                 Out-Null
 
-              robocopy `
-                $themeCacheSource `
-                $themeCacheDestination `
-                /E `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL `
-                /NP
+              Copy-WithRobocopy `
+                -SourcePath $themeCacheSource `
+                -DestinationPath $themeCacheDestination
           }
 
           # --------------------------------------------------------
@@ -478,9 +479,24 @@ jobs:
                   Select-Object -ExpandProperty SID -First 1
               )
 
-              if ($sid) {
+              if (-not $sid) {
+                  Write-Host "Could not find user SID. Registry restore skipped."
+              }
+              else {
 
                   $hkuPath = "Registry::HKEY_USERS\$sid"
+                  $mountedHiveName = "RoxiskPersist"
+                  $mountedHivePath = "Registry::HKEY_USERS\$mountedHiveName"
+                  $ntuser = Join-Path `
+                    $profile `
+                    "NTUSER.DAT"
+
+                  $mountedByUs = $false
+
+                  # ------------------------------------------------
+                  # If the real user hive is already loaded, import
+                  # directly into it.
+                  # ------------------------------------------------
 
                   if (Test-Path $hkuPath) {
 
@@ -489,50 +505,123 @@ jobs:
                       Get-ChildItem `
                         $registryFolder `
                         -Filter "*.reg" |
+                        Sort-Object Name |
                         ForEach-Object {
 
                             Write-Host "Importing $($_.Name)..."
 
-                            reg.exe import $_.FullName
+                            & reg.exe import $_.FullName
+
+                            $regCode = $LASTEXITCODE
+
+                            if ($regCode -ne 0) {
+                                throw "Registry import failed for $($_.Name) with exit code $regCode."
+                            }
                         }
                   }
-                  else {
 
-                      $ntuser = Join-Path `
-                        $profile `
-                        "NTUSER.DAT"
+                  # ------------------------------------------------
+                  # Otherwise temporarily load NTUSER.DAT.
+                  # ------------------------------------------------
 
-                      if (Test-Path $ntuser) {
+                  elseif (Test-Path $ntuser) {
 
-                          Write-Host "Loading NTUSER.DAT..."
+                      Write-Host "Loading NTUSER.DAT..."
 
-                          reg.exe load `
-                            "HKU\RoxiskPersist" `
-                            $ntuser |
-                            Out-Null
+                      if (Test-Path $mountedHivePath) {
+                          Write-Host "Temporary hive already exists. Unloading it first."
 
-                          if ($LASTEXITCODE -eq 0) {
+                          & reg.exe unload "HKU\$mountedHiveName" | Out-Null
+                      }
 
-                              Get-ChildItem `
-                                $registryFolder `
-                                -Filter "*.reg" |
-                                ForEach-Object {
+                      & reg.exe load `
+                        "HKU\$mountedHiveName" `
+                        $ntuser
 
-                                    Write-Host "Importing $($_.Name)..."
+                      $loadCode = $LASTEXITCODE
 
-                                    reg.exe import $_.FullName
+                      if ($loadCode -ne 0) {
+                          throw "Could not load NTUSER.DAT. Exit code: $loadCode."
+                      }
+
+                      $mountedByUs = $true
+
+                      try {
+
+                          Get-ChildItem `
+                            $registryFolder `
+                            -Filter "*.reg" |
+                            Sort-Object Name |
+                            ForEach-Object {
+
+                                Write-Host "Importing $($_.Name)..."
+
+                                $tempReg = Join-Path `
+                                  $env:RUNNER_TEMP `
+                                  "restore-$($_.Name)"
+
+                                # Convert the old HKEY_USERS\<SID> path
+                                # to the temporary hive name.
+                                $content = Get-Content `
+                                  -Path $_.FullName `
+                                  -Raw
+
+                                $content = $content.Replace(
+                                  "HKEY_USERS\$sid",
+                                  "HKEY_USERS\$mountedHiveName"
+                                )
+
+                                Set-Content `
+                                  -Path $tempReg `
+                                  -Value $content `
+                                  -Encoding Unicode
+
+                                & reg.exe import $tempReg
+
+                                $regCode = $LASTEXITCODE
+
+                                Remove-Item `
+                                  $tempReg `
+                                  -Force `
+                                  -ErrorAction SilentlyContinue
+
+                                if ($regCode -ne 0) {
+                                    throw "Registry import failed for $($_.Name) with exit code $regCode."
                                 }
+                            }
+                      }
+                      finally {
 
-                              reg.exe unload `
-                                "HKU\RoxiskPersist" |
+                          if ($mountedByUs) {
+
+                              Write-Host "Unloading temporary user hive..."
+
+                              & reg.exe unload `
+                                "HKU\$mountedHiveName" |
                                 Out-Null
+
+                              $unloadCode = $LASTEXITCODE
+
+                              if ($unloadCode -ne 0) {
+                                  Write-Host "Warning: registry hive unload returned code $unloadCode."
+                              }
+
+                              $mountedByUs = $false
                           }
                       }
+                  }
+                  else {
+                      Write-Host "NTUSER.DAT not found. Registry restore skipped."
                   }
               }
           }
 
           Write-Host "Restore completed."
+
+          # Important:
+          # Robocopy can legitimately return 1-7.
+          # Force this PowerShell step to finish successfully.
+          exit 0
 
       # ============================================================
       # TAILSCALE
@@ -598,7 +687,7 @@ jobs:
             "Prepare-PersistentBackup.ps1"
 
           @'
-          $ErrorActionPreference = "Continue"
+          $ErrorActionPreference = "Stop"
 
           $username = $env:RDP_USERNAME
           $profile = "C:\Users\$username"
@@ -620,6 +709,43 @@ jobs:
             -Path $backup `
             -Force |
             Out-Null
+
+          # --------------------------------------------------------
+          # ROBocopy helper
+          # Codes 0-7 are successful/non-fatal.
+          # Codes 8+ are real Robocopy errors.
+          # --------------------------------------------------------
+
+          function Copy-WithRobocopy {
+              param(
+                  [Parameter(Mandatory = $true)]
+                  [string]$SourcePath,
+
+                  [Parameter(Mandatory = $true)]
+                  [string]$DestinationPath
+              )
+
+              & robocopy `
+                $SourcePath `
+                $DestinationPath `
+                /E `
+                /COPY:DAT `
+                /DCOPY:DAT `
+                /R:1 `
+                /W:1 `
+                /XJ `
+                /NFL `
+                /NDL `
+                /NP
+
+              $code = $LASTEXITCODE
+
+              Write-Host "Robocopy exit code: $code"
+
+              if ($code -ge 8) {
+                  throw "Robocopy failed with exit code $code."
+              }
+          }
 
           # --------------------------------------------------------
           # PERSONAL FOLDERS
@@ -647,18 +773,9 @@ jobs:
                     -Force |
                     Out-Null
 
-                  robocopy `
-                    $src `
-                    $dst `
-                    /E `
-                    /COPY:DAT `
-                    /DCOPY:DAT `
-                    /R:1 `
-                    /W:1 `
-                    /XJ `
-                    /NFL `
-                    /NDL `
-                    /NP
+                  Copy-WithRobocopy `
+                    -SourcePath $src `
+                    -DestinationPath $dst
               }
           }
 
@@ -682,18 +799,9 @@ jobs:
                 -Force |
                 Out-Null
 
-              robocopy `
-                $accountPictures `
-                $dst `
-                /E `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL `
-                /NP
+              Copy-WithRobocopy `
+                -SourcePath $accountPictures `
+                -DestinationPath $dst
           }
 
           # --------------------------------------------------------
@@ -716,18 +824,9 @@ jobs:
                 -Force |
                 Out-Null
 
-              robocopy `
-                $themes `
-                $dst `
-                /E `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL `
-                /NP
+              Copy-WithRobocopy `
+                -SourcePath $themes `
+                -DestinationPath $dst
           }
 
           # --------------------------------------------------------
@@ -750,18 +849,9 @@ jobs:
                 -Force |
                 Out-Null
 
-              robocopy `
-                $themeCache `
-                $dst `
-                /E `
-                /COPY:DAT `
-                /DCOPY:DAT `
-                /R:1 `
-                /W:1 `
-                /XJ `
-                /NFL `
-                /NDL `
-                /NP
+              Copy-WithRobocopy `
+                -SourcePath $themeCache `
+                -DestinationPath $dst
           }
 
           # --------------------------------------------------------
@@ -852,7 +942,9 @@ jobs:
                 $ntuser |
                 Out-Null
 
-              if ($LASTEXITCODE -eq 0) {
+              $loadCode = $LASTEXITCODE
+
+              if ($loadCode -eq 0) {
 
                   reg.exe export `
                     "HKEY_USERS\RoxiskPersist\Control Panel\Desktop" `
@@ -894,9 +986,16 @@ jobs:
                     "HKU\RoxiskPersist" |
                     Out-Null
               }
+              else {
+                  Write-Host "Could not load NTUSER.DAT. Registry backup skipped."
+              }
           }
 
           Write-Host "Checkpoint prepared."
+
+          # Explicit success so Robocopy codes 1-7
+          # never become the final script exit code.
+          exit 0
 
           '@ |
             Set-Content `
