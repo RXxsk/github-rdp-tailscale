@@ -58,14 +58,14 @@ jobs:
           Write-Host "CONFIGURING RDP"
           Write-Host "========================================"
 
-          $username =$env:RDP_USERNAME
-          $password =$env:RDP_PASSWORD
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
 
           if ([string]::IsNullOrWhiteSpace($password)) {
               throw "RDP_PASSWORD is not configured."
           }
 
-          $user = Get-LocalUser -Name$username -ErrorAction SilentlyContinue
+          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
           if (-not $user) {
               Write-Host "Creating user..."
@@ -123,7 +123,7 @@ jobs:
             -Name TermService
 
           Write-Host "RDP configured."
-          
+
       # ============================================================
       # FIND PREVIOUS BACKUP
       # ============================================================
@@ -140,7 +140,7 @@ jobs:
           Write-Host "SEARCHING FOR PREVIOUS BACKUP"
           Write-Host "========================================"
 
-          $repo =$env:GITHUB_REPOSITORY
+          $repo = $env:GITHUB_REPOSITORY
           $currentRun = [int64]$env:GITHUB_RUN_ID
 
           $headers = @{
@@ -185,27 +185,21 @@ jobs:
                   continue
               }
 
-              # Filtrar artifacts válidos y dar máxima prioridad a 'checkpoint-final'
-              $matchingArtifacts = @($runArtifacts.artifacts |
+              $matchingArtifacts = @(
+                $runArtifacts.artifacts |
                   Where-Object {
-                    $_.expired -eq$false -and
+                    $_.expired -eq $false -and
                     (
                       $_.name -like "windows-user-data-checkpoint-*" -or
                       $_.name -eq "windows-user-data"
                     )
                   } |
-                  Sort-Object -Property @{
-                    Expression = {
-                      if ($_.name -eq "windows-user-data-checkpoint-final") { 99 }
-                      elseif ($_.name -like "windows-user-data-checkpoint-*") { [int]($_.name -replace '\D','') }
-                      else { 1 }
-                    }
-                  } -Descending
+                  Sort-Object -Property created_at -Descending
               )
 
               if ($matchingArtifacts.Count -gt 0) {
 
-                  $selectedArtifact =$matchingArtifacts[0]
+                  $selectedArtifact = $matchingArtifacts[0]
 
                   Write-Host ""
                   Write-Host "BACKUP FOUND"
@@ -284,7 +278,7 @@ jobs:
           Write-Host "Backup downloaded."
 
       # ============================================================
-      # RESTORE PERSISTENT DATA
+      # RESTORE PERSISTENT USER DATA
       # ============================================================
 
       - name: Restore persistent user data
@@ -293,14 +287,15 @@ jobs:
         env:
           BACKUP_SOURCE: ${{ steps.previous-backup.outputs.path }}
         run: |
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
 
           Write-Host "========================================"
           Write-Host "RESTORING PERSISTENT DATA"
           Write-Host "========================================"
 
-          $username = $env:RDP_USERNAME$profile = "C:\Users\$username"
-          $source =$env:BACKUP_SOURCE
+          $username = $env:RDP_USERNAME
+          $profile = "C:\Users\$username"
+          $source = $env:BACKUP_SOURCE
 
           if (-not (Test-Path $source)) {
               Write-Host "Backup directory not found."
@@ -313,24 +308,25 @@ jobs:
             -Force |
             Out-Null
 
-          # --------------------------------------------------------
-          # ROBocopy helper
-          # Codes 0-7 are successful/non-fatal.
-          # Codes 8+ are real Robocopy errors.
-          # --------------------------------------------------------
-
           function Copy-WithRobocopy {
-              param(
-                  [Parameter(Mandatory = $true)]
-                  [string]$SourcePath,
-
-                  [Parameter(Mandatory = $true)]
-                  [string]$DestinationPath
+              param (
+                  [string]$Source,
+                  [string]$Destination
               )
 
-              & robocopy `
-                $SourcePath `
-                $DestinationPath `
+              if (-not (Test-Path $Source)) {
+                  return
+              }
+
+              New-Item `
+                -ItemType Directory `
+                -Path $Destination `
+                -Force |
+                Out-Null
+
+              robocopy `
+                $Source `
+                $Destination `
                 /E `
                 /COPY:DAT `
                 /DCOPY:DAT `
@@ -341,12 +337,12 @@ jobs:
                 /NDL `
                 /NP
 
-              $code =$LASTEXITCODE
+              $robocopyCode = $LASTEXITCODE
 
-              Write-Host "Robocopy exit code: $code"
+              Write-Host "Robocopy exit code: $robocopyCode"
 
-              if ($code -ge 8) {
-                  throw "Robocopy failed with exit code $code."
+              if ($robocopyCode -ge 8) {
+                  throw "Robocopy failed with exit code $robocopyCode."
               }
           }
 
@@ -361,23 +357,18 @@ jobs:
             "Pictures"
           )
 
-          foreach ($folder in$folders) {
+          foreach ($folder in $folders) {
 
-              $src = Join-Path$source $folder$dst = Join-Path $profile$folder
+              $src = Join-Path $source $folder
+              $dst = Join-Path $profile $folder
 
               if (Test-Path $src) {
 
                   Write-Host "Restoring $folder..."
 
-                  New-Item `
-                    -ItemType Directory `
-                    -Path $dst `
-                    -Force |
-                    Out-Null
-
                   Copy-WithRobocopy `
-                    -SourcePath $src `
-                    -DestinationPath $dst
+                    -Source $src `
+                    -Destination $dst
               }
           }
 
@@ -397,15 +388,9 @@ jobs:
 
               Write-Host "Restoring account picture..."
 
-              New-Item `
-                -ItemType Directory `
-                -Path $accountPicturesDestination `
-                -Force |
-                Out-Null
-
               Copy-WithRobocopy `
-                -SourcePath $accountPicturesSource `
-                -DestinationPath $accountPicturesDestination
+                -Source $accountPicturesSource `
+                -Destination $accountPicturesDestination
           }
 
           # --------------------------------------------------------
@@ -424,15 +409,9 @@ jobs:
 
               Write-Host "Restoring themes..."
 
-              New-Item `
-                -ItemType Directory `
-                -Path $themeDestination `
-                -Force |
-                Out-Null
-
               Copy-WithRobocopy `
-                -SourcePath $themeSource `
-                -DestinationPath $themeDestination
+                -Source $themeSource `
+                -Destination $themeDestination
           }
 
           # --------------------------------------------------------
@@ -451,15 +430,9 @@ jobs:
 
               Write-Host "Restoring theme cache..."
 
-              New-Item `
-                -ItemType Directory `
-                -Path $themeCacheDestination `
-                -Force |
-                Out-Null
-
               Copy-WithRobocopy `
-                -SourcePath $themeCacheSource `
-                -DestinationPath $themeCacheDestination
+                -Source $themeCacheSource `
+                -Destination $themeCacheDestination
           }
 
           # --------------------------------------------------------
@@ -477,30 +450,15 @@ jobs:
               $sid = (
                 Get-CimInstance Win32_UserAccount |
                   Where-Object {
-                    $_.Name -eq$username -and
-                    $_.LocalAccount -eq$true
+                    $_.Name -eq $username -and
+                    $_.LocalAccount -eq $true
                   } |
                   Select-Object -ExpandProperty SID -First 1
               )
 
-              if (-not $sid) {
-                  Write-Host "Could not find user SID. Registry restore skipped."
-              }
-              else {
+              if ($sid) {
 
                   $hkuPath = "Registry::HKEY_USERS\$sid"
-                  $mountedHiveName = "RoxiskPersist"
-                  $mountedHivePath = "Registry::HKEY_USERS\$mountedHiveName"
-                  $ntuser = Join-Path `
-                    $profile `
-                    "NTUSER.DAT"
-
-                  $mountedByUs =$false
-
-                  # ------------------------------------------------
-                  # If the real user hive is already loaded, import
-                  # directly into it.
-                  # ------------------------------------------------
 
                   if (Test-Path $hkuPath) {
 
@@ -509,122 +467,59 @@ jobs:
                       Get-ChildItem `
                         $registryFolder `
                         -Filter "*.reg" |
-                        Sort-Object Name |
                         ForEach-Object {
 
                             Write-Host "Importing $($_.Name)..."
 
-                            & reg.exe import $_.FullName
+                            reg.exe import $_.FullName
 
-                            $regCode =$LASTEXITCODE
-
-                            if ($regCode -ne 0) {
-                                throw "Registry import failed for $($_.Name) with exit code$regCode."
+                            if ($LASTEXITCODE -ne 0) {
+                                Write-Host "Registry import returned code $LASTEXITCODE."
                             }
                         }
                   }
+                  else {
 
-                  # ------------------------------------------------
-                  # Otherwise temporarily load NTUSER.DAT.
-                  # ------------------------------------------------
+                      $ntuser = Join-Path `
+                        $profile `
+                        "NTUSER.DAT"
 
-                  elseif (Test-Path $ntuser) {
+                      if (Test-Path $ntuser) {
 
-                      Write-Host "Loading NTUSER.DAT..."
+                          Write-Host "Loading NTUSER.DAT..."
 
-                      if (Test-Path $mountedHivePath) {
-                          Write-Host "Temporary hive already exists. Unloading it first."
+                          reg.exe load `
+                            "HKU\RoxiskPersist" `
+                            $ntuser |
+                            Out-Null
 
-                          & reg.exe unload "HKU\$mountedHiveName" | Out-Null
-                      }
+                          if ($LASTEXITCODE -eq 0) {
 
-                      & reg.exe load `
-                        "HKU\$mountedHiveName" `
-                        $ntuser
+                              Get-ChildItem `
+                                $registryFolder `
+                                -Filter "*.reg" |
+                                ForEach-Object {
 
-                      $loadCode =$LASTEXITCODE
+                                    Write-Host "Importing $($_.Name)..."
 
-                      if ($loadCode -ne 0) {
-                          throw "Could not load NTUSER.DAT. Exit code: $loadCode."
-                      }
+                                    reg.exe import $_.FullName
 
-                      $mountedByUs =$true
-
-                      try {
-
-                          Get-ChildItem `
-                            $registryFolder `
-                            -Filter "*.reg" |
-                            Sort-Object Name |
-                            ForEach-Object {
-
-                                Write-Host "Importing $($_.Name)..."
-
-                                $tempReg = Join-Path `
-                                  $env:RUNNER_TEMP `
-                                  "restore-$($_.Name)"
-
-                                # Convert the old HKEY_USERS\<SID> path
-                                # to the temporary hive name.
-                                $content = Get-Content `
-                                  -Path $_.FullName `
-                                  -Raw
-
-                                $content =$content.Replace(
-                                  "HKEY_USERS\$sid",
-                                  "HKEY_USERS\$mountedHiveName"
-                                )
-
-                                Set-Content `
-                                  -Path $tempReg `
-                                  -Value $content `
-                                  -Encoding Unicode
-
-                                & reg.exe import $tempReg
-
-                                $regCode = $LASTEXITCODE
-
-                                Remove-Item `
-                                  $tempReg `
-                                  -Force `
-                                  -ErrorAction SilentlyContinue
-
-                                if ($regCode -ne 0) {
-                                    throw "Registry import failed for $($_.Name) with exit code$regCode."
+                                    if ($LASTEXITCODE -ne 0) {
+                                        Write-Host "Registry import returned code $LASTEXITCODE."
+                                    }
                                 }
-                            }
-                      }
-                      finally {
 
-                          if ($mountedByUs) {
-
-                              Write-Host "Unloading temporary user hive..."
-
-                              & reg.exe unload `
-                                "HKU\$mountedHiveName" |
+                              reg.exe unload `
+                                "HKU\RoxiskPersist" |
                                 Out-Null
-
-                              $unloadCode = $LASTEXITCODE
-
-                              if ($unloadCode -ne 0) {
-                                  Write-Host "Warning: registry hive unload returned code $unloadCode."
-                              }
-
-                              $mountedByUs = $false
                           }
                       }
-                  }
-                  else {
-                      Write-Host "NTUSER.DAT not found. Registry restore skipped."
                   }
               }
           }
 
           Write-Host "Restore completed."
 
-          # Important:
-          # Robocopy can legitimately return 1-7.
-          # Force this PowerShell step to finish successfully.
           exit 0
 
       # ============================================================
@@ -691,10 +586,11 @@ jobs:
             "Prepare-PersistentBackup.ps1"
 
           @'
-          $ErrorActionPreference = "Stop"
+          $ErrorActionPreference = "Continue"
 
-          $username = $env:RDP_USERNAME$profile = "C:\Users\$username"
-          $backup =$env:BACKUP_DIR
+          $username = $env:RDP_USERNAME
+          $profile = "C:\Users\$username"
+          $backup = $env:BACKUP_DIR
 
           Write-Host "========================================"
           Write-Host "CREATING CHECKPOINT"
@@ -713,24 +609,25 @@ jobs:
             -Force |
             Out-Null
 
-          # --------------------------------------------------------
-          # ROBocopy helper
-          # Codes 0-7 are successful/non-fatal.
-          # Codes 8+ are real Robocopy errors.
-          # --------------------------------------------------------
-
           function Copy-WithRobocopy {
-              param(
-                  [Parameter(Mandatory = $true)]
-                  [string]$SourcePath,
-
-                  [Parameter(Mandatory = $true)]
-                  [string]$DestinationPath
+              param (
+                  [string]$Source,
+                  [string]$Destination
               )
 
-              & robocopy `
-                $SourcePath `
-                $DestinationPath `
+              if (-not (Test-Path $Source)) {
+                  return
+              }
+
+              New-Item `
+                -ItemType Directory `
+                -Path $Destination `
+                -Force |
+                Out-Null
+
+              robocopy `
+                $Source `
+                $Destination `
                 /E `
                 /COPY:DAT `
                 /DCOPY:DAT `
@@ -741,12 +638,12 @@ jobs:
                 /NDL `
                 /NP
 
-              $code = $LASTEXITCODE
+              $robocopyCode = $LASTEXITCODE
 
-              Write-Host "Robocopy exit code: $code"
+              Write-Host "Robocopy exit code: $robocopyCode"
 
-              if ($code -ge 8) {
-                  throw "Robocopy failed with exit code $code."
+              if ($robocopyCode -ge 8) {
+                  Write-Host "Robocopy reported a real error."
               }
           }
 
@@ -770,15 +667,9 @@ jobs:
 
                   Write-Host "Saving $folder..."
 
-                  New-Item `
-                    -ItemType Directory `
-                    -Path $dst `
-                    -Force |
-                    Out-Null
-
                   Copy-WithRobocopy `
-                    -SourcePath $src `
-                    -DestinationPath $dst
+                    -Source $src `
+                    -Destination $dst
               }
           }
 
@@ -796,15 +687,9 @@ jobs:
                 $backup `
                 "AccountPictures"
 
-              New-Item `
-                -ItemType Directory `
-                -Path $dst `
-                -Force |
-                Out-Null
-
               Copy-WithRobocopy `
-                -SourcePath $accountPictures `
-                -DestinationPath $dst
+                -Source $accountPictures `
+                -Destination $dst
           }
 
           # --------------------------------------------------------
@@ -821,15 +706,9 @@ jobs:
                 $backup `
                 "Themes"
 
-              New-Item `
-                -ItemType Directory `
-                -Path $dst `
-                -Force |
-                Out-Null
-
               Copy-WithRobocopy `
-                -SourcePath $themes `
-                -DestinationPath $dst
+                -Source $themes `
+                -Destination $dst
           }
 
           # --------------------------------------------------------
@@ -846,15 +725,9 @@ jobs:
                 $backup `
                 "ThemeCache"
 
-              New-Item `
-                -ItemType Directory `
-                -Path $dst `
-                -Force |
-                Out-Null
-
               Copy-WithRobocopy `
-                -SourcePath $themeCache `
-                -DestinationPath $dst
+                -Source $themeCache `
+                -Destination $dst
           }
 
           # --------------------------------------------------------
@@ -878,13 +751,13 @@ jobs:
           $sid = (
             Get-CimInstance Win32_UserAccount |
               Where-Object {
-                $_.Name -eq$username -and
-                $_.LocalAccount -eq$true
+                $_.Name -eq $username -and
+                $_.LocalAccount -eq $true
               } |
               Select-Object -ExpandProperty SID -First 1
           )
 
-          $loaded =$false
+          $loaded = $false
 
           if ($sid) {
 
@@ -894,7 +767,7 @@ jobs:
 
                   Write-Host "User hive is loaded."
 
-                  $loaded =$true
+                  $loaded = $true
               }
           }
 
@@ -945,9 +818,7 @@ jobs:
                 $ntuser |
                 Out-Null
 
-              $loadCode =$LASTEXITCODE
-
-              if ($loadCode -eq 0) {
+              if ($LASTEXITCODE -eq 0) {
 
                   reg.exe export `
                     "HKEY_USERS\RoxiskPersist\Control Panel\Desktop" `
@@ -989,16 +860,9 @@ jobs:
                     "HKU\RoxiskPersist" |
                     Out-Null
               }
-              else {
-                  Write-Host "Could not load NTUSER.DAT. Registry backup skipped."
-              }
           }
 
           Write-Host "Checkpoint prepared."
-
-          # Explicit success so Robocopy codes 1-7
-          # never become the final script exit code.
-          exit 0
 
           '@ |
             Set-Content `
@@ -1042,7 +906,7 @@ jobs:
 
       - name: Upload checkpoint 01
         if: ${{ fromJSON(inputs.duration_minutes) >= 45 }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-01
@@ -1065,7 +929,7 @@ jobs:
 
       - name: Upload checkpoint 02
         if: ${{ fromJSON(inputs.duration_minutes) >= 90 }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-02
@@ -1088,7 +952,7 @@ jobs:
 
       - name: Upload checkpoint 03
         if: ${{ fromJSON(inputs.duration_minutes) >= 135 }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-03
@@ -1111,7 +975,7 @@ jobs:
 
       - name: Upload checkpoint 04
         if: ${{ fromJSON(inputs.duration_minutes) >= 180 }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-04
@@ -1134,7 +998,7 @@ jobs:
 
       - name: Upload checkpoint 05
         if: ${{ fromJSON(inputs.duration_minutes) >= 225 }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-05
@@ -1157,7 +1021,7 @@ jobs:
 
       - name: Upload checkpoint 06
         if: ${{ fromJSON(inputs.duration_minutes) >= 270 }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-06
@@ -1180,7 +1044,7 @@ jobs:
 
       - name: Upload checkpoint 07
         if: ${{ fromJSON(inputs.duration_minutes) >= 315 }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-07
@@ -1236,7 +1100,7 @@ jobs:
       # ============================================================
 
       - name: Upload final checkpoint
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-final
