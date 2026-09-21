@@ -4,14 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       duration_minutes:
-        description: "Tiempo de la sesión RDP (5-330 minutos)"
+        description: "Duración de la sesión RDP en minutos"
         required: true
         default: "60"
-        type: string
+        type: choice
+        options:
+          - "5"
+          - "10"
+          - "15"
+          - "30"
+          - "45"
+          - "60"
+          - "90"
+          - "120"
+          - "150"
+          - "180"
+          - "210"
+          - "240"
+          - "270"
+          - "300"
+          - "330"
 
 jobs:
   rdp:
-
+    name: Windows RDP
     runs-on: windows-2025
     timeout-minutes: 360
 
@@ -32,751 +48,237 @@ jobs:
       # ============================================================
 
       - name: Configure RDP
-        shell: pwsh
+        shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $minutes = [int]"${{ inputs.duration_minutes }}"
+          $ErrorActionPreference = "Stop"
 
-          if ($minutes -lt 5 -or $minutes -gt 330) {
-            throw "duration_minutes debe estar entre 5 y 330."
+          Write-Host "========================================"
+          Write-Host " CONFIGURANDO RDP"
+          Write-Host "========================================"
+
+          $username = $env:RDP_USERNAME
+          $password = $env:RDP_PASSWORD
+
+          if ([string]::IsNullOrWhiteSpace($password)) {
+              throw "RDP_PASSWORD no está configurado."
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "Falta el secret RDP_PASSWORD."
-          }
+          # Crear usuario si no existe
+          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
-          $securePassword = ConvertTo-SecureString `
-            $env:RDP_PASSWORD `
-            -AsPlainText `
-            -Force
+          if (-not $user) {
+              Write-Host "Creando usuario $username..."
+              $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
-          $existing = Get-LocalUser `
-            -Name $env:RDP_USERNAME `
-            -ErrorAction SilentlyContinue
+              New-LocalUser `
+                -Name $username `
+                -Password $securePassword `
+                -FullName $username `
+                -Description "Temporary RDP user"
 
-          if ($null -eq $existing) {
-
-            New-LocalUser `
-              -Name $env:RDP_USERNAME `
-              -Password $securePassword `
-              -AccountNeverExpires `
-              -PasswordNeverExpires `
-              -UserMayNotChangePassword `
-              -Description "Temporary GitHub Actions RDP administrator"
-
+              Write-Host "Usuario creado."
           }
           else {
+              Write-Host "El usuario $username ya existe."
 
-            Set-LocalUser `
-              -Name $env:RDP_USERNAME `
-              -Password $securePassword
-
-            Enable-LocalUser `
-              -Name $env:RDP_USERNAME
+              $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+              Set-LocalUser -Name $username -Password $securePassword
           }
 
+          # Activar usuario
+          Enable-LocalUser -Name $username
+
+          # Agregar a Remote Desktop Users
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
-            -Member $env:RDP_USERNAME `
+            -Member $username `
             -ErrorAction SilentlyContinue
 
+          # Administrador
           Add-LocalGroupMember `
             -Group "Administrators" `
-            -Member $env:RDP_USERNAME `
+            -Member $username `
             -ErrorAction SilentlyContinue
 
-          New-Item `
-            -ItemType Directory `
-            -Path $env:PERSISTENT_DIR `
-            -Force |
-            Out-Null
-
+          # Activar Remote Desktop
           Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' `
-            -Type DWord `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
             -Value 0
 
-          Set-ItemProperty `
-            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' `
-            -Type DWord `
-            -Value 1
-
-          Set-Service `
-            -Name TermService `
-            -StartupType Automatic
-
-          Start-Service `
-            -Name TermService `
+          # Permitir RDP en firewall
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
             -ErrorAction SilentlyContinue
 
-          Get-NetFirewallRule `
-            -DisplayGroup 'Remote Desktop' `
-            -ErrorAction SilentlyContinue |
-            Enable-NetFirewallRule `
-            -ErrorAction SilentlyContinue
+          # Asegurar servicio
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
 
-          if (-not (Get-NetFirewallRule `
-            -DisplayName 'GitHub RDP 3389' `
-            -ErrorAction SilentlyContinue)) {
-
-            New-NetFirewallRule `
-              -DisplayName 'GitHub RDP 3389' `
-              -Direction Inbound `
-              -Protocol TCP `
-              -LocalPort 3389 `
-              -Action Allow `
-              -Profile Any |
-              Out-Null
-          }
-
-          "RDP_USER=$env:RDP_USERNAME" >> $env:GITHUB_ENV
+          Write-Host ""
+          Write-Host "RDP configurado correctamente."
+          Write-Host "Usuario: $username"
 
       # ============================================================
-      # 2. BUSCAR EL ÚLTIMO CHECKPOINT
+      # 2. BUSCAR BACKUP ANTERIOR
       # ============================================================
 
       - name: Find previous backup
-        shell: pwsh
+        id: previous-backup
+        shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "========================================"
-          Write-Host " BUSCANDO ÚLTIMO RESPALDO"
+          Write-Host " BUSCANDO BACKUP ANTERIOR"
           Write-Host "========================================"
 
-          New-Item `
-            -ItemType Directory `
-            -Path $env:BACKUP_DIR `
-            -Force |
-            Out-Null
+          $repo = $env:GITHUB_REPOSITORY
+          $currentRun = [int64]$env:GITHUB_RUN_ID
 
           $headers = @{
-            Authorization = "Bearer $env:GH_TOKEN"
-            Accept = "application/vnd.github+json"
-            "X-GitHub-Api-Version" = "2022-11-28"
+            "Accept"               = "application/vnd.github+json"
+            "Authorization"        = "Bearer $env:GH_TOKEN"
+            "X-GitHub-Api-Version" = "2026-03-10"
           }
 
-          $repo = "${{ github.repository }}"
+          $runsUrl = "https://api.github.com/repos/$repo/actions/runs?per_page=20"
 
-          # Buscar ejecuciones completadas, incluyendo failed/cancelled.
-          $runsUrl = `
-            "https://api.github.com/repos/$repo/actions/runs?status=completed&per_page=50"
+          Write-Host "Consultando ejecuciones anteriores..."
 
-          try {
+          $runsResponse = Invoke-RestMethod `
+            -Uri $runsUrl `
+            -Headers $headers `
+            -Method Get
 
-            $runs = Invoke-RestMethod `
-              -Uri $runsUrl `
-              -Headers $headers `
-              -Method Get
-
-            $previousRun = $runs.workflow_runs |
+          $candidateRuns = @(
+            $runsResponse.workflow_runs |
               Where-Object {
-                $_.id -ne [int64]"${{ github.run_id }}" `
-                -and $_.name -eq "Windows RDP + Tailscale"
+                $_.id -ne $currentRun -and
+                $_.name -eq "Windows RDP + Tailscale" -and
+                $_.status -eq "completed"
               } |
-              Sort-Object created_at -Descending |
-              Select-Object -First 1
+              Sort-Object -Property created_at -Descending
+          )
 
-            if ($null -eq $previousRun) {
+          $selectedArtifact = $null
 
-              Write-Host "No existe una ejecución anterior."
-              "HAS_BACKUP=false" >> $env:GITHUB_ENV
-              exit 0
+          foreach ($run in $candidateRuns) {
+
+            Write-Host "Revisando run $($run.id)..."
+
+            $artifactUrl = "https://api.github.com/repos/$repo/actions/runs/$($run.id)/artifacts?per_page=100"
+
+            try {
+              $runArtifacts = Invoke-RestMethod `
+                -Uri $artifactUrl `
+                -Headers $headers `
+                -Method Get
+            }
+            catch {
+              Write-Host "No se pudieron consultar los artefactos de este run."
+              continue
             }
 
-            Write-Host "Ejecución anterior:"
-            Write-Host "Run ID: $($previousRun.id)"
-            Write-Host "Conclusión: $($previousRun.conclusion)"
+            $matchingArtifacts = @(
+              $runArtifacts.artifacts |
+                Where-Object {
+                  $_.expired -eq $false -and
+                  (
+                    $_.name -like "windows-user-data-checkpoint-*" -or
+                    $_.name -eq "windows-user-data"
+                  )
+                } |
+                Sort-Object -Property created_at -Descending
+            )
 
-            $artifactsUrl = `
-              "https://api.github.com/repos/$repo/actions/runs/$($previousRun.id)/artifacts?per_page=100"
+            if ($matchingArtifacts.Count -gt 0) {
+              $selectedArtifact = $matchingArtifacts[0]
 
-            $artifacts = Invoke-RestMethod `
-              -Uri $artifactsUrl `
-              -Headers $headers `
-              -Method Get
+              Write-Host ""
+              Write-Host "BACKUP ENCONTRADO"
+              Write-Host "Run: $($run.id)"
+              Write-Host "Artifact: $($selectedArtifact.name)"
+              Write-Host "Artifact ID: $($selectedArtifact.id)"
+              Write-Host ""
 
-            # ========================================================
-            # BUSCAR CHECKPOINTS NUEVOS
-            # ========================================================
-
-            $backup = $artifacts.artifacts |
-              Where-Object {
-                $_.expired -eq $false `
-                -and (
-                  $_.name -like "windows-user-data-checkpoint-*"
-                  -or $_.name -eq "windows-user-data"
-                )
-              } |
-              Sort-Object created_at -Descending |
-              Select-Object -First 1
-
-            if ($null -eq $backup) {
-
-              Write-Host "No se encontró ningún checkpoint."
-              "HAS_BACKUP=false" >> $env:GITHUB_ENV
-              exit 0
+              break
             }
-
-            Write-Host ""
-            Write-Host "RESPALDO ENCONTRADO"
-            Write-Host "Nombre: $($backup.name)"
-            Write-Host "Artifact ID: $($backup.id)"
-            Write-Host "Creado: $($backup.created_at)"
-
-            $downloadUrl = `
-              "https://api.github.com/repos/$repo/actions/artifacts/$($backup.id)/zip"
-
-            $zipPath = Join-Path `
-              $env:BACKUP_DIR `
-              "windows-user-data.zip"
-
-            Invoke-WebRequest `
-              -Uri $downloadUrl `
-              -Headers $headers `
-              -OutFile $zipPath
-
-            Expand-Archive `
-              -Path $zipPath `
-              -DestinationPath $env:BACKUP_DIR `
-              -Force
-
-            Remove-Item `
-              -Path $zipPath `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-            "HAS_BACKUP=true" >> $env:GITHUB_ENV
-
-            Write-Host ""
-            Write-Host "Respaldo descargado correctamente."
-
           }
-          catch {
 
-            Write-Host ""
-            Write-Host "No fue posible descargar el respaldo."
-            Write-Host "La sesión continuará sin restauración."
-            Write-Host "Detalle: $($_.Exception.Message)"
-
-            "HAS_BACKUP=false" >> $env:GITHUB_ENV
+          if (-not $selectedArtifact) {
+            Write-Host "No existe ningún backup anterior disponible."
+            "found=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            exit 0
           }
+
+          $downloadUrl = "https://api.github.com/repos/$repo/actions/artifacts/$($selectedArtifact.id)/zip"
+          $zipPath = Join-Path $env:RUNNER_TEMP "previous-backup.zip"
+          $extractPath = Join-Path $env:RUNNER_TEMP "previous-backup"
+
+          if (Test-Path $zipPath) {
+            Remove-Item $zipPath -Force
+          }
+
+          if (Test-Path $extractPath) {
+            Remove-Item $extractPath -Recurse -Force
+          }
+
+          Write-Host "Descargando backup..."
+
+          Invoke-WebRequest `
+            -Uri $downloadUrl `
+            -Headers $headers `
+            -OutFile $zipPath
+
+          New-Item -ItemType Directory -Path $extractPath -Force | Out-Null
+
+          Expand-Archive `
+            -Path $zipPath `
+            -DestinationPath $extractPath `
+            -Force
+
+          "found=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "path=$extractPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          Write-Host "Backup descargado correctamente."
 
       # ============================================================
-      # 3. RESTAURAR ARCHIVOS Y CONFIGURACIONES
+      # 3. RESTAURAR DATOS
       # ============================================================
 
       - name: Restore persistent user data
-        if: ${{ env.HAS_BACKUP == 'true' }}
-        shell: pwsh
+        if: ${{ steps.previous-backup.outputs.found == 'true' }}
+        shell: powershell
+        env:
+          BACKUP_SOURCE: ${{ steps.previous-backup.outputs.path }}
         run: |
+          $ErrorActionPreference = "Continue"
 
           Write-Host "========================================"
           Write-Host " RESTAURANDO DATOS"
           Write-Host "========================================"
 
-          $profilePath = "C:\Users\$env:RDP_USERNAME"
+          $username = $env:RDP_USERNAME
+          $profile = "C:\Users\$username"
+          $source = $env:BACKUP_SOURCE
 
-          if (-not (Test-Path $profilePath)) {
-            throw "No se encontró el perfil: $profilePath"
+          if (-not (Test-Path $source)) {
+              Write-Host "No se encontró el directorio del backup."
+              exit 0
           }
 
-          $backupProfile = `
-            Join-Path $env:BACKUP_DIR "Profile"
-
-          # ========================================================
-          # CARPETAS PERSONALES
-          # ========================================================
-
-          if (Test-Path $backupProfile) {
-
-            $folders = @(
-              "Desktop",
-              "Documents",
-              "Downloads",
-              "Pictures"
-            )
-
-            foreach ($folder in $folders) {
-
-              $source = Join-Path `
-                $backupProfile `
-                $folder
-
-              $destination = Join-Path `
-                $profilePath `
-                $folder
-
-              if (Test-Path $source) {
-
-                New-Item `
-                  -ItemType Directory `
-                  -Path $destination `
-                  -Force |
-                  Out-Null
-
-                Copy-Item `
-                  -Path "$source\*" `
-                  -Destination $destination `
-                  -Recurse `
-                  -Force `
-                  -ErrorAction SilentlyContinue
-
-                Write-Host "Restaurado: $folder"
-              }
-            }
-          }
-
-          # ========================================================
-          # FOTO DE CUENTA
-          # ========================================================
-
-          $accountPicturesSource = Join-Path `
-            $env:BACKUP_DIR `
-            "AccountPictures"
-
-          $accountPicturesDestination = Join-Path `
-            $profilePath `
-            "AppData\Roaming\Microsoft\Windows\AccountPictures"
-
-          if (Test-Path $accountPicturesSource) {
-
-            New-Item `
-              -ItemType Directory `
-              -Path $accountPicturesDestination `
-              -Force |
-              Out-Null
-
-            Copy-Item `
-              -Path "$accountPicturesSource\*" `
-              -Destination $accountPicturesDestination `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-            Write-Host "Foto de cuenta restaurada."
-          }
-
-          # ========================================================
-          # TEMAS LOCALES
-          # ========================================================
-
-          $themesSource = Join-Path `
-            $env:BACKUP_DIR `
-            "Themes"
-
-          $themesDestination = Join-Path `
-            $profilePath `
-            "AppData\Local\Microsoft\Windows\Themes"
-
-          if (Test-Path $themesSource) {
-
-            New-Item `
-              -ItemType Directory `
-              -Path $themesDestination `
-              -Force |
-              Out-Null
-
-            Copy-Item `
-              -Path "$themesSource\*" `
-              -Destination $themesDestination `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-            Write-Host "Temas locales restaurados."
-          }
-
-          # ========================================================
-          # CACHE DE TEMAS / WALLPAPER
-          # ========================================================
-
-          $themeCacheSource = Join-Path `
-            $env:BACKUP_DIR `
-            "ThemeCache"
-
-          $themeCacheDestination = Join-Path `
-            $profilePath `
-            "AppData\Roaming\Microsoft\Windows\Themes"
-
-          if (Test-Path $themeCacheSource) {
-
-            New-Item `
-              -ItemType Directory `
-              -Path $themeCacheDestination `
-              -Force |
-              Out-Null
-
-            Copy-Item `
-              -Path "$themeCacheSource\*" `
-              -Destination $themeCacheDestination `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-            Write-Host "Cache de temas restaurado."
-          }
-
-          # ========================================================
-          # RESTAURAR REGISTRO DE PERSONALIZACIÓN
-          # ========================================================
-
-          $registryBackup = `
-            Join-Path $env:BACKUP_DIR "Registry"
-
-          $userHive = `
-            Join-Path $profilePath "NTUSER.DAT"
-
-          $tempHiveName = "RoxiskPersist"
-
-          if ((Test-Path $registryBackup) -and (Test-Path $userHive)) {
-
-            Write-Host ""
-            Write-Host "Restaurando Personalización..."
-
-            $user = Get-LocalUser `
-              -Name $env:RDP_USERNAME
-
-            $sid = $user.SID.Value
-
-            $sidRegistryPath = `
-              "Registry::HKEY_USERS\$sid"
-
-            $hiveWasAlreadyLoaded = `
-              Test-Path $sidRegistryPath
-
-            $targetRoot = $null
-            $loadedTemporaryHive = $false
-
-            if ($hiveWasAlreadyLoaded) {
-
-              Write-Host "El hive del usuario ya está cargado."
-
-              $targetRoot = "HKEY_USERS\$sid"
-
-            }
-            else {
-
-              Write-Host "Cargando NTUSER.DAT temporalmente..."
-
-              reg.exe unload `
-                "HKU\$tempHiveName" `
-                2>$null |
-                Out-Null
-
-              reg.exe load `
-                "HKU\$tempHiveName" `
-                "$userHive" |
-                Out-Null
-
-              if ($LASTEXITCODE -eq 0) {
-
-                $targetRoot = `
-                  "HKEY_USERS\$tempHiveName"
-
-                $loadedTemporaryHive = $true
-
-                Write-Host "NTUSER.DAT cargado."
-              }
-              else {
-
-                Write-Host "No se pudo cargar NTUSER.DAT."
-              }
-            }
-
-            if ($null -ne $targetRoot) {
-
-              $registryFiles = Get-ChildItem `
-                -Path $registryBackup `
-                -Filter "*.reg" `
-                -File `
-                -ErrorAction SilentlyContinue
-
-              foreach ($registryFile in $registryFiles) {
-
-                Write-Host `
-                  "Restaurando: $($registryFile.Name)"
-
-                $content = Get-Content `
-                  -Path $registryFile.FullName `
-                  -Raw `
-                  -ErrorAction SilentlyContinue
-
-                if (-not [string]::IsNullOrWhiteSpace($content)) {
-
-                  $content = $content.Replace(
-                    "HKEY_CURRENT_USER",
-                    $targetRoot
-                  )
-
-                  $tempReg = Join-Path `
-                    $env:TEMP `
-                    ("restore-" + $registryFile.Name)
-
-                  Set-Content `
-                    -Path $tempReg `
-                    -Value $content `
-                    -Encoding Unicode
-
-                  reg.exe import `
-                    "$tempReg" |
-                    Out-Null
-
-                  Remove-Item `
-                    -Path $tempReg `
-                    -Force `
-                    -ErrorAction SilentlyContinue
-                }
-              }
-
-              Write-Host "Registro de Personalización restaurado."
-            }
-
-            if ($loadedTemporaryHive) {
-
-              reg.exe unload `
-                "HKU\$tempHiveName" `
-                2>$null |
-                Out-Null
-            }
-          }
-          else {
-
-            Write-Host "No existe respaldo de registro."
-          }
-
-          Write-Host ""
-          Write-Host "RESTAURACIÓN COMPLETADA."
-
-      # ============================================================
-      # 4. CONECTAR TAILSCALE
-      # ============================================================
-
-      - name: Connect runner to Tailscale
-        uses: tailscale/github-action@v4
-        with:
-          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
-          audience: ${{ secrets.TS_AUDIENCE }}
-          tags: tag:ci
-
-      # ============================================================
-      # 5. VERIFICAR TAILSCALE Y RDP
-      # ============================================================
-
-      - name: Verify Tailscale and RDP
-        shell: pwsh
-        run: |
-
-          Write-Host "========================================"
-          Write-Host " VERIFICANDO TAILSCALE"
-          Write-Host "========================================"
-
-          $ipOutput = @(tailscale ip -4 2>&1)
-
-          $ipOutput | ForEach-Object {
-            Write-Host $_
-          }
-
-          $ip = $null
-
-          foreach ($line in $ipOutput) {
-
-            $text = "$line".Trim()
-
-            if ($text -match '^\d{1,3}(\.\d{1,3}){3}$') {
-
-              $ip = $text
-              break
-            }
-          }
-
-          if ([string]::IsNullOrWhiteSpace($ip)) {
-
-            tailscale status
-
-            throw "No se obtuvo una IPv4 de Tailscale."
-          }
-
-          Write-Host ""
-          Write-Host "IPv4 de Tailscale: $ip"
-
-          # ========================================================
-          # RDP
-          # ========================================================
-
-          $rdpService = Get-Service `
-            -Name TermService `
-            -ErrorAction SilentlyContinue
-
-          if ($null -eq $rdpService) {
-            throw "No existe TermService."
-          }
-
-          Write-Host "TermService: $($rdpService.Status)"
-
-          if ($rdpService.Status -ne 'Running') {
-
-            Start-Service `
-              -Name TermService `
-              -ErrorAction SilentlyContinue
-
-            Start-Sleep -Seconds 3
-          }
-
-          # ========================================================
-          # PUERTO 3389
-          # ========================================================
-
-          $rdpReady = $false
-
-          for ($i = 1; $i -le 15; $i++) {
-
-            $tcp = Test-NetConnection `
-              -ComputerName '127.0.0.1' `
-              -Port 3389 `
-              -WarningAction SilentlyContinue
-
-            Write-Host `
-              "Intento $i/15 - TCP 3389: $($tcp.TcpTestSucceeded)"
-
-            if ($tcp.TcpTestSucceeded) {
-
-              $rdpReady = $true
-              break
-            }
-
-            Start-Sleep -Seconds 2
-          }
-
-          if (-not $rdpReady) {
-
-            Get-NetTCPConnection `
-              -State Listen `
-              -ErrorAction SilentlyContinue |
-              Sort-Object LocalPort |
-              Format-Table -AutoSize
-
-            throw "RDP no está escuchando en TCP 3389."
-          }
-
-          "TAILSCALE_IPV4=$ip" >> $env:GITHUB_ENV
-
-          $summary = @"
-          ## Windows RDP listo
-
-          **PC / Tailscale IPv4:** ${ip}:3389
-
-          **Usuario:** $env:RDP_USERNAME
-
-          **Contraseña:** usa el secret ``RDP_PASSWORD``.
-
-          ### Conexión
-
-          En Windows App agrega:
-
-          `${ip}:3389`
-
-          Tu dispositivo debe estar conectado al mismo tailnet.
-
-          ### Estado
-
-          - Tailscale: conectado
-          - IPv4: ${ip}
-          - RDP: TCP 3389 escuchando
-          - Usuario: $env:RDP_USERNAME
-          - Administrador: Sí
-          - Persistencia: habilitada
-          - Checkpoints: cada 45 minutos
-          "@
-
-          Add-Content `
-            -Path $env:GITHUB_STEP_SUMMARY `
-            -Value $summary
-
-          Write-Host ""
-          Write-Host "========================================"
-          Write-Host " RDP LISTO"
-          Write-Host "========================================"
-          Write-Host "Tailscale IPv4: $ip"
-          Write-Host "Dirección RDP: ${ip}:3389"
-          Write-Host "Usuario: $env:RDP_USERNAME"
-          Write-Host "Administrador: Sí"
-
-      # ============================================================
-      # 6. INICIAR RELOJ DE SESIÓN
-      # ============================================================
-
-      - name: Initialize session clock
-        shell: pwsh
-        run: |
-
-          $sessionStart = Get-Date
-
-          "SESSION_START=$($sessionStart.ToString('o'))" `
-            >> $env:GITHUB_ENV
-
-          Write-Host "Inicio de sesión: $sessionStart"
-          Write-Host "Duración: ${{ inputs.duration_minutes }} minutos."
-
-      # ============================================================
-      # 7. CREAR SCRIPT DE RESPALDO
-      # ============================================================
-
-      - name: Create backup script
-        shell: pwsh
-        run: |
-
-          $scriptPath = Join-Path `
-            $env:RUNNER_TEMP `
-            "Prepare-PersistentBackup.ps1"
-
-          @'
-          $ErrorActionPreference = "Continue"
-
-          Write-Host "========================================"
-          Write-Host " PREPARANDO CHECKPOINT"
-          Write-Host "========================================"
-
-          $profilePath = "C:\Users\$env:RDP_USERNAME"
-
-          if (-not (Test-Path $profilePath)) {
-
-            Write-Host "Perfil no encontrado."
-            exit 0
-          }
-
-          $backupRoot = "C:\PersistentBackup"
-
-          $backupProfile = `
-            Join-Path $backupRoot "Profile"
-
-          $registryBackup = `
-            Join-Path $backupRoot "Registry"
-
-          Remove-Item `
-            -Path $backupRoot `
-            -Recurse `
-            -Force `
-            -ErrorAction SilentlyContinue
-
-          New-Item `
-            -ItemType Directory `
-            -Path $backupProfile `
-            -Force |
-            Out-Null
-
-          New-Item `
-            -ItemType Directory `
-            -Path $registryBackup `
-            -Force |
-            Out-Null
-
-          # ========================================================
-          # CARPETAS PERSONALES
-          # ========================================================
+          New-Item -ItemType Directory `
+            -Path $env:PERSISTENT_DIR `
+            -Force | Out-Null
+
+          # --------------------------------------------------------
+          # Restaurar carpetas personales
+          # --------------------------------------------------------
 
           $folders = @(
             "Desktop",
@@ -787,635 +289,769 @@ jobs:
 
           foreach ($folder in $folders) {
 
-            $source = Join-Path `
-              $profilePath `
-              $folder
+            $src = Join-Path $source $folder
+            $dst = Join-Path $profile $folder
 
-            $destination = Join-Path `
-              $backupProfile `
-              $folder
+            if (Test-Path $src) {
 
-            if (Test-Path $source) {
+              Write-Host "Restaurando $folder..."
 
-              New-Item `
-                -ItemType Directory `
-                -Path $destination `
-                -Force |
-                Out-Null
+              New-Item -ItemType Directory `
+                -Path $dst `
+                -Force | Out-Null
 
-              Copy-Item `
-                -Path "$source\*" `
-                -Destination $destination `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue
+              robocopy `
+                $src `
+                $dst `
+                /E `
+                /COPY:DAT `
+                /DCOPY:DAT `
+                /R:1 `
+                /W:1 `
+                /XJ `
+                /NFL `
+                /NDL `
+                /NP
 
-              Write-Host "Guardado: $folder"
+              Write-Host "$folder restaurado."
             }
           }
 
-          # ========================================================
-          # FOTO DE CUENTA
-          # ========================================================
+          # --------------------------------------------------------
+          # AccountPictures
+          # --------------------------------------------------------
 
           $accountPicturesSource = Join-Path `
-            $profilePath `
-            "AppData\Roaming\Microsoft\Windows\AccountPictures"
+            $source `
+            "AccountPictures"
 
-          $accountPicturesDestination = `
-            Join-Path $backupRoot "AccountPictures"
+          $accountPicturesDestination = Join-Path `
+            $profile `
+            "AppData\Roaming\Microsoft\Windows\AccountPictures"
 
           if (Test-Path $accountPicturesSource) {
 
-            New-Item `
-              -ItemType Directory `
+            Write-Host "Restaurando imagen de cuenta..."
+
+            New-Item -ItemType Directory `
               -Path $accountPicturesDestination `
-              -Force |
-              Out-Null
+              -Force | Out-Null
 
-            Copy-Item `
-              -Path "$accountPicturesSource\*" `
-              -Destination $accountPicturesDestination `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-            Write-Host "Guardado: foto de cuenta."
+            robocopy `
+              $accountPicturesSource `
+              $accountPicturesDestination `
+              /E `
+              /COPY:DAT `
+              /DCOPY:DAT `
+              /R:1 `
+              /W:1 `
+              /XJ `
+              /NFL `
+              /NDL `
+              /NP
           }
 
-          # ========================================================
-          # TEMAS LOCALES
-          # ========================================================
+          # --------------------------------------------------------
+          # Themes
+          # --------------------------------------------------------
 
-          $themesSource = Join-Path `
-            $profilePath `
-            "AppData\Local\Microsoft\Windows\Themes"
+          $themeSource = Join-Path $source "Themes"
 
-          $themesDestination = `
-            Join-Path $backupRoot "Themes"
-
-          if (Test-Path $themesSource) {
-
-            New-Item `
-              -ItemType Directory `
-              -Path $themesDestination `
-              -Force |
-              Out-Null
-
-            Copy-Item `
-              -Path "$themesSource\*" `
-              -Destination $themesDestination `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-            Write-Host "Guardado: temas locales."
-          }
-
-          # ========================================================
-          # CACHE DE WALLPAPER / TEMAS
-          # ========================================================
-
-          $themeCacheSource = Join-Path `
-            $profilePath `
+          $themeDestination = Join-Path `
+            $profile `
             "AppData\Roaming\Microsoft\Windows\Themes"
 
-          $themeCacheDestination = `
-            Join-Path $backupRoot "ThemeCache"
+          if (Test-Path $themeSource) {
+
+            Write-Host "Restaurando temas..."
+
+            New-Item -ItemType Directory `
+              -Path $themeDestination `
+              -Force | Out-Null
+
+            robocopy `
+              $themeSource `
+              $themeDestination `
+              /E `
+              /COPY:DAT `
+              /DCOPY:DAT `
+              /R:1 `
+              /W:1 `
+              /XJ `
+              /NFL `
+              /NDL `
+              /NP
+          }
+
+          # --------------------------------------------------------
+          # ThemeCache
+          # --------------------------------------------------------
+
+          $themeCacheSource = Join-Path $source "ThemeCache"
+
+          $themeCacheDestination = Join-Path `
+            $profile `
+            "AppData\Local\Microsoft\Windows\Themes"
 
           if (Test-Path $themeCacheSource) {
 
-            New-Item `
-              -ItemType Directory `
+            Write-Host "Restaurando cache de temas..."
+
+            New-Item -ItemType Directory `
               -Path $themeCacheDestination `
-              -Force |
-              Out-Null
+              -Force | Out-Null
 
-            Copy-Item `
-              -Path "$themeCacheSource\*" `
-              -Destination $themeCacheDestination `
-              -Recurse `
-              -Force `
-              -ErrorAction SilentlyContinue
-
-            Write-Host "Guardado: cache de wallpaper/temas."
+            robocopy `
+              $themeCacheSource `
+              $themeCacheDestination `
+              /E `
+              /COPY:DAT `
+              /DCOPY:DAT `
+              /R:1 `
+              /W:1 `
+              /XJ `
+              /NFL `
+              /NDL `
+              /NP
           }
 
-          # ========================================================
-          # REGISTRO DE PERSONALIZACIÓN
-          # ========================================================
+          # --------------------------------------------------------
+          # REGISTRO DEL USUARIO
+          # --------------------------------------------------------
 
-          Write-Host ""
-          Write-Host "Guardando configuración de Personalización..."
+          $registryFolder = Join-Path $source "Registry"
 
-          $userHive = `
-            Join-Path $profilePath "NTUSER.DAT"
+          if (Test-Path $registryFolder) {
 
-          if (Test-Path $userHive) {
+            Write-Host ""
+            Write-Host "Restaurando configuraciones del registro..."
 
-            $user = Get-LocalUser `
-              -Name $env:RDP_USERNAME
+            $sid = (
+              Get-CimInstance Win32_UserAccount |
+                Where-Object {
+                  $_.Name -eq $username -and
+                  $_.LocalAccount -eq $true
+                } |
+                Select-Object -ExpandProperty SID -First 1
+            )
 
-            $sid = $user.SID.Value
+            if ($sid) {
 
-            $sidRegistryPath = `
-              "Registry::HKEY_USERS\$sid"
+              $hkuPath = "Registry::HKEY_USERS\$sid"
 
-            $hiveWasAlreadyLoaded = `
-              Test-Path $sidRegistryPath
+              if (Test-Path $hkuPath) {
 
-            $sourceRoot = $null
-            $loadedTemporaryHive = $false
-            $tempHiveName = "RoxiskPersist"
+                Write-Host "La sesión del usuario ya tiene el hive cargado."
 
-            if ($hiveWasAlreadyLoaded) {
+                Get-ChildItem $registryFolder -Filter "*.reg" |
+                  ForEach-Object {
 
-              Write-Host "Hive del usuario ya está cargado."
+                    Write-Host "Importando $($_.Name)..."
 
-              $sourceRoot = "HKEY_USERS\$sid"
-            }
-            else {
-
-              Write-Host "Cargando NTUSER.DAT..."
-
-              reg.exe unload `
-                "HKU\$tempHiveName" `
-                2>$null |
-                Out-Null
-
-              reg.exe load `
-                "HKU\$tempHiveName" `
-                "$userHive" |
-                Out-Null
-
-              if ($LASTEXITCODE -eq 0) {
-
-                $sourceRoot = `
-                  "HKEY_USERS\$tempHiveName"
-
-                $loadedTemporaryHive = $true
-
-                Write-Host "NTUSER.DAT cargado correctamente."
+                    reg.exe import $_.FullName
+                  }
               }
               else {
 
-                Write-Host "No se pudo cargar NTUSER.DAT."
-              }
-            }
+                $ntuser = Join-Path $profile "NTUSER.DAT"
 
-            if ($null -ne $sourceRoot) {
+                if (Test-Path $ntuser) {
 
-              $registryKeys = @(
-                "Control Panel\Desktop",
-                "Software\Microsoft\Windows\CurrentVersion\Themes",
-                "Software\Microsoft\Windows\CurrentVersion\Themes\Personalize",
-                "Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers",
-                "Software\Microsoft\Windows\CurrentVersion\Explorer\Accent",
-                "Software\Microsoft\Windows\DWM"
-              )
+                  Write-Host "Cargando NTUSER.DAT temporalmente..."
 
-              foreach ($key in $registryKeys) {
+                  reg.exe load "HKU\RoxiskPersist" $ntuser | Out-Null
 
-                $safeName = $key `
-                  -replace '[\\/:*?"<>|]', '_' `
-                  -replace ' ', '_'
+                  if ($LASTEXITCODE -eq 0) {
 
-                $outputFile = Join-Path `
-                  $registryBackup `
-                  "$safeName.reg"
+                    Get-ChildItem $registryFolder -Filter "*.reg" |
+                      ForEach-Object {
 
-                $sourceKey = `
-                  "$sourceRoot\$key"
+                        Write-Host "Importando $($_.Name)..."
 
-                Write-Host "Guardando registro: $key"
+                        reg.exe import $_.FullName
+                      }
 
-                reg.exe export `
-                  "$sourceKey" `
-                  "$outputFile" `
-                  /y |
-                  Out-Null
-
-                if ($LASTEXITCODE -eq 0) {
-
-                  $content = Get-Content `
-                    -Path $outputFile `
-                    -Raw `
-                    -ErrorAction SilentlyContinue
-
-                  if (-not [string]::IsNullOrWhiteSpace($content)) {
-
-                    $content = $content.Replace(
-                      $sourceRoot,
-                      "HKEY_CURRENT_USER"
-                    )
-
-                    Set-Content `
-                      -Path $outputFile `
-                      -Value $content `
-                      -Encoding Unicode
+                    reg.exe unload "HKU\RoxiskPersist" | Out-Null
                   }
-
-                  Write-Host "Guardado: $key"
-                }
-                else {
-
-                  Remove-Item `
-                    -Path $outputFile `
-                    -Force `
-                    -ErrorAction SilentlyContinue
-
-                  Write-Host "No se pudo guardar: $key"
+                  else {
+                    Write-Host "No se pudo cargar NTUSER.DAT."
+                  }
                 }
               }
             }
-
-            if ($loadedTemporaryHive) {
-
-              reg.exe unload `
-                "HKU\$tempHiveName" `
-                2>$null |
-                Out-Null
-            }
-          }
-          else {
-
-            Write-Host "No se encontró NTUSER.DAT."
           }
 
           Write-Host ""
+          Write-Host "Restauración terminada."
+
+      # ============================================================
+      # 4. TAILSCALE
+      # ============================================================
+
+      - name: Connect runner to Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+
+      # ============================================================
+      # 5. VERIFICAR RDP + TAILSCALE
+      # ============================================================
+
+      - name: Verify Tailscale and RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
           Write-Host "========================================"
-          Write-Host " CHECKPOINT PREPARADO"
+          Write-Host " VERIFICANDO TAILSCALE + RDP"
           Write-Host "========================================"
+
+          Write-Host ""
+          Write-Host "Tailscale IPv4:"
+
+          tailscale ip -4
+
+          Write-Host ""
+          Write-Host "Estado de TermService:"
+
+          Get-Service TermService |
+            Select-Object Status, Name, DisplayName
+
+          Write-Host ""
+          Write-Host "Puerto TCP 3389:"
+
+          $test = Test-NetConnection `
+            -ComputerName 127.0.0.1 `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $test.TcpTestSucceeded) {
+            throw "El puerto TCP 3389 no está disponible."
+          }
+
+          Write-Host "TCP 3389: OK"
+
+          Write-Host ""
+          Write-Host "========================================"
+          Write-Host " RDP LISTO"
+          Write-Host "========================================"
+
+      # ============================================================
+      # 6. CREAR SCRIPT DE BACKUP
+      # ============================================================
+
+      - name: Create backup script
+        shell: powershell
+        run: |
+          $scriptPath = Join-Path $env:RUNNER_TEMP "Prepare-PersistentBackup.ps1"
+
+          @'
+          $ErrorActionPreference = "Continue"
+
+          $username = $env:RDP_USERNAME
+          $profile = "C:\Users\$username"
+          $backup = $env:BACKUP_DIR
+
+          Write-Host "========================================"
+          Write-Host " CREANDO CHECKPOINT"
+          Write-Host "========================================"
+
+          if (Test-Path $backup) {
+              Remove-Item $backup -Recurse -Force
+          }
+
+          New-Item `
+            -ItemType Directory `
+            -Path $backup `
+            -Force | Out-Null
+
+          # --------------------------------------------------------
+          # Carpetas personales
+          # --------------------------------------------------------
+
+          $folders = @(
+            "Desktop",
+            "Documents",
+            "Downloads",
+            "Pictures"
+          )
+
+          foreach ($folder in $folders) {
+
+            $src = Join-Path $profile $folder
+            $dst = Join-Path $backup $folder
+
+            if (Test-Path $src) {
+
+              Write-Host "Guardando $folder..."
+
+              New-Item `
+                -ItemType Directory `
+                -Path $dst `
+                -Force | Out-Null
+
+              robocopy `
+                $src `
+                $dst `
+                /E `
+                /COPY:DAT `
+                /DCOPY:DAT `
+                /R:1 `
+                /W:1 `
+                /XJ `
+                /NFL `
+                /NDL `
+                /NP
+            }
+          }
+
+          # --------------------------------------------------------
+          # Imagen de cuenta
+          # --------------------------------------------------------
+
+          $accountPictures = Join-Path `
+            $profile `
+            "AppData\Roaming\Microsoft\Windows\AccountPictures"
+
+          if (Test-Path $accountPictures) {
+
+            $dst = Join-Path $backup "AccountPictures"
+
+            New-Item `
+              -ItemType Directory `
+              -Path $dst `
+              -Force | Out-Null
+
+            robocopy `
+              $accountPictures `
+              $dst `
+              /E `
+              /COPY:DAT `
+              /DCOPY:DAT `
+              /R:1 `
+              /W:1 `
+              /XJ `
+              /NFL `
+              /NDL `
+              /NP
+          }
+
+          # --------------------------------------------------------
+          # Tema
+          # --------------------------------------------------------
+
+          $themes = Join-Path `
+            $profile `
+            "AppData\Roaming\Microsoft\Windows\Themes"
+
+          if (Test-Path $themes) {
+
+            $dst = Join-Path $backup "Themes"
+
+            New-Item `
+              -ItemType Directory `
+              -Path $dst `
+              -Force | Out-Null
+
+            robocopy `
+              $themes `
+              $dst `
+              /E `
+              /COPY:DAT `
+              /DCOPY:DAT `
+              /R:1 `
+              /W:1 `
+              /XJ `
+              /NFL `
+              /NDL `
+              /NP
+          }
+
+          # --------------------------------------------------------
+          # Cache del tema
+          # --------------------------------------------------------
+
+          $themeCache = Join-Path `
+            $profile `
+            "AppData\Local\Microsoft\Windows\Themes"
+
+          if (Test-Path $themeCache) {
+
+            $dst = Join-Path $backup "ThemeCache"
+
+            New-Item `
+              -ItemType Directory `
+              -Path $dst `
+              -Force | Out-Null
+
+            robocopy `
+              $themeCache `
+              $dst `
+              /E `
+              /COPY:DAT `
+              /DCOPY:DAT `
+              /R:1 `
+              /W:1 `
+              /XJ `
+              /NFL `
+              /NDL `
+              /NP
+          }
+
+          # --------------------------------------------------------
+          # REGISTRO
+          # --------------------------------------------------------
+
+          $registryBackup = Join-Path $backup "Registry"
+
+          New-Item `
+            -ItemType Directory `
+            -Path $registryBackup `
+            -Force | Out-Null
+
+          $ntuser = Join-Path $profile "NTUSER.DAT"
+
+          $sid = (
+            Get-CimInstance Win32_UserAccount |
+              Where-Object {
+                $_.Name -eq $username -and
+                $_.LocalAccount -eq $true
+              } |
+              Select-Object -ExpandProperty SID -First 1
+          )
+
+          $loaded = $false
+
+          if ($sid) {
+
+            $loadedPath = "Registry::HKEY_USERS\$sid"
+
+            if (Test-Path $loadedPath) {
+
+              Write-Host "El hive de $username ya está cargado."
+
+              $loaded = $true
+            }
+          }
+
+          if ($loaded) {
+
+            reg.exe export `
+              "HKEY_USERS\$sid\Control Panel\Desktop" `
+              (Join-Path $registryBackup "Desktop.reg") `
+              /y | Out-Null
+
+            reg.exe export `
+              "HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Themes" `
+              (Join-Path $registryBackup "Themes.reg") `
+              /y | Out-Null
+
+            reg.exe export `
+              "HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" `
+              (Join-Path $registryBackup "Personalize.reg") `
+              /y | Out-Null
+
+            reg.exe export `
+              "HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers" `
+              (Join-Path $registryBackup "Wallpapers.reg") `
+              /y | Out-Null
+
+            reg.exe export `
+              "HKEY_USERS\$sid\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent" `
+              (Join-Path $registryBackup "Accent.reg") `
+              /y | Out-Null
+
+            reg.exe export `
+              "HKEY_USERS\$sid\Software\Microsoft\Windows\DWM" `
+              (Join-Path $registryBackup "DWM.reg") `
+              /y | Out-Null
+          }
+          elseif (Test-Path $ntuser) {
+
+            Write-Host "Cargando NTUSER.DAT temporalmente..."
+
+            reg.exe load `
+              "HKU\RoxiskPersist" `
+              $ntuser | Out-Null
+
+            if ($LASTEXITCODE -eq 0) {
+
+              reg.exe export `
+                "HKEY_USERS\RoxiskPersist\Control Panel\Desktop" `
+                (Join-Path $registryBackup "Desktop.reg") `
+                /y | Out-Null
+
+              reg.exe export `
+                "HKEY_USERS\RoxiskPersist\Software\Microsoft\Windows\CurrentVersion\Themes" `
+                (Join-Path $registryBackup "Themes.reg") `
+                /y | Out-Null
+
+              reg.exe export `
+                "HKEY_USERS\RoxiskPersist\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize" `
+                (Join-Path $registryBackup "Personalize.reg") `
+                /y | Out-Null
+
+              reg.exe export `
+                "HKEY_USERS\RoxiskPersist\Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers" `
+                (Join-Path $registryBackup "Wallpapers.reg") `
+                /y | Out-Null
+
+              reg.exe export `
+                "HKEY_USERS\RoxiskPersist\Software\Microsoft\Windows\CurrentVersion\Explorer\Accent" `
+                (Join-Path $registryBackup "Accent.reg") `
+                /y | Out-Null
+
+              reg.exe export `
+                "HKEY_USERS\RoxiskPersist\Software\Microsoft\Windows\DWM" `
+                (Join-Path $registryBackup "DWM.reg") `
+                /y | Out-Null
+
+              reg.exe unload "HKU\RoxiskPersist" | Out-Null
+            }
+            else {
+              Write-Host "No se pudo cargar NTUSER.DAT."
+            }
+          }
+
+          Write-Host ""
+          Write-Host "Checkpoint preparado."
 
           '@ | Set-Content `
             -Path $scriptPath `
             -Encoding UTF8
 
-          "BACKUP_SCRIPT_PATH=$scriptPath" >> $env:GITHUB_ENV
-
-          Write-Host "Script creado:"
+          Write-Host "Script creado en:"
           Write-Host $scriptPath
 
       # ============================================================
-      # 8. MANTENER RDP ACTIVO EN SEGUNDO PLANO
+      # 7. MANTENER LA SESIÓN RDP VIVA
       # ============================================================
 
-      - name: Keep session alive
+      - name: Keep RDP session alive
         id: keep-session
-        shell: pwsh
-        timeout-minutes: 350
-        continue-on-error: true
+        shell: powershell
         background: true
+        timeout-minutes: 350
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
         run: |
-
-          $minutes = [int]"${{ inputs.duration_minutes }}"
+          $minutes = [int]$env:DURATION_MINUTES
 
           Write-Host "========================================"
           Write-Host " SESIÓN RDP ACTIVA"
+          Write-Host " Duración: $minutes minutos"
           Write-Host "========================================"
 
-          Write-Host "Duración: $minutes minutos."
-
-          $deadline = `
-            (Get-Date).AddMinutes($minutes)
-
-          while ((Get-Date) -lt $deadline) {
-
-            Start-Sleep -Seconds 30
-          }
+          Start-Sleep -Seconds ($minutes * 60)
 
           Write-Host "Tiempo de sesión terminado."
 
       # ============================================================
-      # CHECKPOINT 1 - 45 MINUTOS
+      # 8. CHECKPOINT 45 MIN
       # ============================================================
 
-      - name: Wait for checkpoint 01
+      - name: Checkpoint 45 minutes
         if: ${{ fromJSON(inputs.duration_minutes) >= 45 }}
-        shell: pwsh
-        timeout-minutes: 50
+        shell: powershell
         run: |
+          Start-Sleep -Seconds (45 * 60)
 
-          $start = [DateTime]::Parse("$env:SESSION_START")
-
-          $target = $start.AddMinutes(45)
-
-          while ((Get-Date) -lt $target) {
-
-            $remaining = $target - (Get-Date)
-
-            Write-Host `
-              "Checkpoint 01 en $([math]::Round($remaining.TotalMinutes,1)) minutos."
-
-            Start-Sleep -Seconds 30
-          }
-
-      - name: Prepare checkpoint 01
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 45 }}
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          & "$env:BACKUP_SCRIPT_PATH"
+          & "$env:RUNNER_TEMP\Prepare-PersistentBackup.ps1"
 
       - name: Upload checkpoint 01
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 45 }}
-        uses: actions/upload-artifact@v4
+        if: ${{ fromJSON(inputs.duration_minutes) >= 45 }}
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-01
           path: C:\PersistentBackup
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           compression-level: 6
 
       # ============================================================
-      # CHECKPOINT 2 - 90 MINUTOS
+      # 9. CHECKPOINT 90 MIN
       # ============================================================
 
-      - name: Wait for checkpoint 02
+      - name: Checkpoint 90 minutes
         if: ${{ fromJSON(inputs.duration_minutes) >= 90 }}
-        shell: pwsh
-        timeout-minutes: 50
+        shell: powershell
         run: |
+          Start-Sleep -Seconds (45 * 60)
 
-          $start = [DateTime]::Parse("$env:SESSION_START")
-
-          $target = $start.AddMinutes(90)
-
-          while ((Get-Date) -lt $target) {
-
-            Start-Sleep -Seconds 30
-          }
-
-      - name: Prepare checkpoint 02
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 90 }}
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          & "$env:BACKUP_SCRIPT_PATH"
+          & "$env:RUNNER_TEMP\Prepare-PersistentBackup.ps1"
 
       - name: Upload checkpoint 02
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 90 }}
-        uses: actions/upload-artifact@v4
+        if: ${{ fromJSON(inputs.duration_minutes) >= 90 }}
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-02
           path: C:\PersistentBackup
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           compression-level: 6
 
       # ============================================================
-      # CHECKPOINT 3 - 135 MINUTOS
+      # 10. CHECKPOINT 135 MIN
       # ============================================================
 
-      - name: Wait for checkpoint 03
+      - name: Checkpoint 135 minutes
         if: ${{ fromJSON(inputs.duration_minutes) >= 135 }}
-        shell: pwsh
-        timeout-minutes: 50
+        shell: powershell
         run: |
+          Start-Sleep -Seconds (45 * 60)
 
-          $start = [DateTime]::Parse("$env:SESSION_START")
-
-          $target = $start.AddMinutes(135)
-
-          while ((Get-Date) -lt $target) {
-
-            Start-Sleep -Seconds 30
-          }
-
-      - name: Prepare checkpoint 03
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 135 }}
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          & "$env:BACKUP_SCRIPT_PATH"
+          & "$env:RUNNER_TEMP\Prepare-PersistentBackup.ps1"
 
       - name: Upload checkpoint 03
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 135 }}
-        uses: actions/upload-artifact@v4
+        if: ${{ fromJSON(inputs.duration_minutes) >= 135 }}
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-03
           path: C:\PersistentBackup
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           compression-level: 6
 
       # ============================================================
-      # CHECKPOINT 4 - 180 MINUTOS
+      # 11. CHECKPOINT 180 MIN
       # ============================================================
 
-      - name: Wait for checkpoint 04
+      - name: Checkpoint 180 minutes
         if: ${{ fromJSON(inputs.duration_minutes) >= 180 }}
-        shell: pwsh
-        timeout-minutes: 50
+        shell: powershell
         run: |
+          Start-Sleep -Seconds (45 * 60)
 
-          $start = [DateTime]::Parse("$env:SESSION_START")
-
-          $target = $start.AddMinutes(180)
-
-          while ((Get-Date) -lt $target) {
-
-            Start-Sleep -Seconds 30
-          }
-
-      - name: Prepare checkpoint 04
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 180 }}
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          & "$env:BACKUP_SCRIPT_PATH"
+          & "$env:RUNNER_TEMP\Prepare-PersistentBackup.ps1"
 
       - name: Upload checkpoint 04
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 180 }}
-        uses: actions/upload-artifact@v4
+        if: ${{ fromJSON(inputs.duration_minutes) >= 180 }}
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-04
           path: C:\PersistentBackup
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           compression-level: 6
 
       # ============================================================
-      # CHECKPOINT 5 - 225 MINUTOS
+      # 12. CHECKPOINT 225 MIN
       # ============================================================
 
-      - name: Wait for checkpoint 05
+      - name: Checkpoint 225 minutes
         if: ${{ fromJSON(inputs.duration_minutes) >= 225 }}
-        shell: pwsh
-        timeout-minutes: 50
+        shell: powershell
         run: |
+          Start-Sleep -Seconds (45 * 60)
 
-          $start = [DateTime]::Parse("$env:SESSION_START")
-
-          $target = $start.AddMinutes(225)
-
-          while ((Get-Date) -lt $target) {
-
-            Start-Sleep -Seconds 30
-          }
-
-      - name: Prepare checkpoint 05
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 225 }}
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          & "$env:BACKUP_SCRIPT_PATH"
+          & "$env:RUNNER_TEMP\Prepare-PersistentBackup.ps1"
 
       - name: Upload checkpoint 05
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 225 }}
-        uses: actions/upload-artifact@v4
+        if: ${{ fromJSON(inputs.duration_minutes) >= 225 }}
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-05
           path: C:\PersistentBackup
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           compression-level: 6
 
       # ============================================================
-      # CHECKPOINT 6 - 270 MINUTOS
+      # 13. CHECKPOINT 270 MIN
       # ============================================================
 
-      - name: Wait for checkpoint 06
+      - name: Checkpoint 270 minutes
         if: ${{ fromJSON(inputs.duration_minutes) >= 270 }}
-        shell: pwsh
-        timeout-minutes: 50
+        shell: powershell
         run: |
+          Start-Sleep -Seconds (45 * 60)
 
-          $start = [DateTime]::Parse("$env:SESSION_START")
-
-          $target = $start.AddMinutes(270)
-
-          while ((Get-Date) -lt $target) {
-
-            Start-Sleep -Seconds 30
-          }
-
-      - name: Prepare checkpoint 06
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 270 }}
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          & "$env:BACKUP_SCRIPT_PATH"
+          & "$env:RUNNER_TEMP\Prepare-PersistentBackup.ps1"
 
       - name: Upload checkpoint 06
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 270 }}
-        uses: actions/upload-artifact@v4
+        if: ${{ fromJSON(inputs.duration_minutes) >= 270 }}
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-06
           path: C:\PersistentBackup
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           compression-level: 6
 
       # ============================================================
-      # CHECKPOINT 7 - 315 MINUTOS
+      # 14. CHECKPOINT 315 MIN
       # ============================================================
 
-      - name: Wait for checkpoint 07
+      - name: Checkpoint 315 minutes
         if: ${{ fromJSON(inputs.duration_minutes) >= 315 }}
-        shell: pwsh
-        timeout-minutes: 50
+        shell: powershell
         run: |
+          Start-Sleep -Seconds (45 * 60)
 
-          $start = [DateTime]::Parse("$env:SESSION_START")
-
-          $target = $start.AddMinutes(315)
-
-          while ((Get-Date) -lt $target) {
-
-            Start-Sleep -Seconds 30
-          }
-
-      - name: Prepare checkpoint 07
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 315 }}
-        shell: pwsh
-        continue-on-error: true
-        run: |
-          & "$env:BACKUP_SCRIPT_PATH"
+          & "$env:RUNNER_TEMP\Prepare-PersistentBackup.ps1"
 
       - name: Upload checkpoint 07
-        if: ${{ always() && fromJSON(inputs.duration_minutes) >= 315 }}
-        uses: actions/upload-artifact@v4
+        if: ${{ fromJSON(inputs.duration_minutes) >= 315 }}
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-07
           path: C:\PersistentBackup
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           compression-level: 6
 
       # ============================================================
-      # CHECKPOINT FINAL
+      # 15. CHECKPOINT FINAL
       # ============================================================
 
-      - name: Wait for session end
-        shell: pwsh
-        timeout-minutes: 20
+      - name: Final checkpoint
+        shell: powershell
+        env:
+          DURATION_MINUTES: ${{ inputs.duration_minutes }}
         run: |
+          $minutes = [int]$env:DURATION_MINUTES
 
-          $start = [DateTime]::Parse("$env:SESSION_START")
+          $checkpointTimes = @(45, 90, 135, 180, 225, 270, 315)
 
-          $minutes = [int]"${{ inputs.duration_minutes }}"
+          $lastCheckpoint = 0
 
-          $target = $start.AddMinutes($minutes)
-
-          Write-Host "Esperando hasta el final de la sesión..."
-
-          while ((Get-Date) -lt $target) {
-
-            Start-Sleep -Seconds 30
+          foreach ($checkpoint in $checkpointTimes) {
+              if ($minutes -ge $checkpoint) {
+                  $lastCheckpoint = $checkpoint
+              }
           }
 
-          Write-Host "Hora final alcanzada."
+          $remaining = $minutes - $lastCheckpoint
 
-      - name: Prepare final checkpoint
-        if: always()
-        shell: pwsh
-        continue-on-error: true
-        run: |
+          if ($remaining -gt 0) {
+              Write-Host "Esperando $remaining minutos hasta el checkpoint final..."
+              Start-Sleep -Seconds ($remaining * 60)
+          }
 
-          Write-Host "========================================"
-          Write-Host " RESPALDO FINAL"
-          Write-Host "========================================"
-
-          & "$env:BACKUP_SCRIPT_PATH"
+          & "$env:RUNNER_TEMP\Prepare-PersistentBackup.ps1"
 
       - name: Upload final checkpoint
-        if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-final
           path: C:\PersistentBackup
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 90
           compression-level: 6
 
       # ============================================================
-      # ESPERAR A QUE TERMINE EL PROCESO EN SEGUNDO PLANO
+      # 16. TERMINAR SESIÓN
       # ============================================================
 
       - name: Finish RDP session
         wait: keep-session
-
-      # ============================================================
-      # FINAL
-      # ============================================================
-
-      - name: Session finished
-        if: always()
-        shell: pwsh
-        run: |
-
-          Write-Host "========================================"
-          Write-Host " SESIÓN FINALIZADA"
-          Write-Host "========================================"
-
-          Write-Host "Los checkpoints fueron enviados a GitHub."
-          Write-Host "El runner temporal será destruido al finalizar."
