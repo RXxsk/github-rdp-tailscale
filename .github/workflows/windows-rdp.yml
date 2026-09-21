@@ -58,14 +58,14 @@ jobs:
           Write-Host "CONFIGURING RDP"
           Write-Host "========================================"
 
-          $username = $env:RDP_USERNAME
-          $password = $env:RDP_PASSWORD
+          $username =$env:RDP_USERNAME
+          $password =$env:RDP_PASSWORD
 
           if ([string]::IsNullOrWhiteSpace($password)) {
               throw "RDP_PASSWORD is not configured."
           }
 
-          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          $user = Get-LocalUser -Name$username -ErrorAction SilentlyContinue
 
           if (-not $user) {
               Write-Host "Creating user..."
@@ -140,7 +140,7 @@ jobs:
           Write-Host "SEARCHING FOR PREVIOUS BACKUP"
           Write-Host "========================================"
 
-          $repo = $env:GITHUB_REPOSITORY
+          $repo =$env:GITHUB_REPOSITORY
           $currentRun = [int64]$env:GITHUB_RUN_ID
 
           $headers = @{
@@ -185,21 +185,27 @@ jobs:
                   continue
               }
 
-              $matchingArtifacts = @(
-                $runArtifacts.artifacts |
+              # Filtrar artifacts válidos y dar máxima prioridad a 'checkpoint-final'
+              $matchingArtifacts = @($runArtifacts.artifacts |
                   Where-Object {
-                    $_.expired -eq $false -and
+                    $_.expired -eq$false -and
                     (
                       $_.name -like "windows-user-data-checkpoint-*" -or
                       $_.name -eq "windows-user-data"
                     )
                   } |
-                  Sort-Object -Property created_at -Descending
+                  Sort-Object -Property @{
+                    Expression = {
+                      if ($_.name -eq "windows-user-data-checkpoint-final") { 99 }
+                      elseif ($_.name -like "windows-user-data-checkpoint-*") { [int]($_.name -replace '\D','') }
+                      else { 1 }
+                    }
+                  } -Descending
               )
 
               if ($matchingArtifacts.Count -gt 0) {
 
-                  $selectedArtifact = $matchingArtifacts[0]
+                  $selectedArtifact =$matchingArtifacts[0]
 
                   Write-Host ""
                   Write-Host "BACKUP FOUND"
@@ -293,9 +299,8 @@ jobs:
           Write-Host "RESTORING PERSISTENT DATA"
           Write-Host "========================================"
 
-          $username = $env:RDP_USERNAME
-          $profile = "C:\Users\$username"
-          $source = $env:BACKUP_SOURCE
+          $username = $env:RDP_USERNAME$profile = "C:\Users\$username"
+          $source =$env:BACKUP_SOURCE
 
           if (-not (Test-Path $source)) {
               Write-Host "Backup directory not found."
@@ -336,7 +341,7 @@ jobs:
                 /NDL `
                 /NP
 
-              $code = $LASTEXITCODE
+              $code =$LASTEXITCODE
 
               Write-Host "Robocopy exit code: $code"
 
@@ -356,10 +361,9 @@ jobs:
             "Pictures"
           )
 
-          foreach ($folder in $folders) {
+          foreach ($folder in$folders) {
 
-              $src = Join-Path $source $folder
-              $dst = Join-Path $profile $folder
+              $src = Join-Path$source $folder$dst = Join-Path $profile$folder
 
               if (Test-Path $src) {
 
@@ -473,8 +477,8 @@ jobs:
               $sid = (
                 Get-CimInstance Win32_UserAccount |
                   Where-Object {
-                    $_.Name -eq $username -and
-                    $_.LocalAccount -eq $true
+                    $_.Name -eq$username -and
+                    $_.LocalAccount -eq$true
                   } |
                   Select-Object -ExpandProperty SID -First 1
               )
@@ -491,7 +495,7 @@ jobs:
                     $profile `
                     "NTUSER.DAT"
 
-                  $mountedByUs = $false
+                  $mountedByUs =$false
 
                   # ------------------------------------------------
                   # If the real user hive is already loaded, import
@@ -512,10 +516,10 @@ jobs:
 
                             & reg.exe import $_.FullName
 
-                            $regCode = $LASTEXITCODE
+                            $regCode =$LASTEXITCODE
 
                             if ($regCode -ne 0) {
-                                throw "Registry import failed for $($_.Name) with exit code $regCode."
+                                throw "Registry import failed for $($_.Name) with exit code$regCode."
                             }
                         }
                   }
@@ -538,13 +542,13 @@ jobs:
                         "HKU\$mountedHiveName" `
                         $ntuser
 
-                      $loadCode = $LASTEXITCODE
+                      $loadCode =$LASTEXITCODE
 
                       if ($loadCode -ne 0) {
                           throw "Could not load NTUSER.DAT. Exit code: $loadCode."
                       }
 
-                      $mountedByUs = $true
+                      $mountedByUs =$true
 
                       try {
 
@@ -566,7 +570,7 @@ jobs:
                                   -Path $_.FullName `
                                   -Raw
 
-                                $content = $content.Replace(
+                                $content =$content.Replace(
                                   "HKEY_USERS\$sid",
                                   "HKEY_USERS\$mountedHiveName"
                                 )
@@ -586,7 +590,7 @@ jobs:
                                   -ErrorAction SilentlyContinue
 
                                 if ($regCode -ne 0) {
-                                    throw "Registry import failed for $($_.Name) with exit code $regCode."
+                                    throw "Registry import failed for $($_.Name) with exit code$regCode."
                                 }
                             }
                       }
@@ -689,9 +693,8 @@ jobs:
           @'
           $ErrorActionPreference = "Stop"
 
-          $username = $env:RDP_USERNAME
-          $profile = "C:\Users\$username"
-          $backup = $env:BACKUP_DIR
+          $username = $env:RDP_USERNAME$profile = "C:\Users\$username"
+          $backup =$env:BACKUP_DIR
 
           Write-Host "========================================"
           Write-Host "CREATING CHECKPOINT"
@@ -875,13 +878,13 @@ jobs:
           $sid = (
             Get-CimInstance Win32_UserAccount |
               Where-Object {
-                $_.Name -eq $username -and
-                $_.LocalAccount -eq $true
+                $_.Name -eq$username -and
+                $_.LocalAccount -eq$true
               } |
               Select-Object -ExpandProperty SID -First 1
           )
 
-          $loaded = $false
+          $loaded =$false
 
           if ($sid) {
 
@@ -891,7 +894,7 @@ jobs:
 
                   Write-Host "User hive is loaded."
 
-                  $loaded = $true
+                  $loaded =$true
               }
           }
 
@@ -942,7 +945,7 @@ jobs:
                 $ntuser |
                 Out-Null
 
-              $loadCode = $LASTEXITCODE
+              $loadCode =$LASTEXITCODE
 
               if ($loadCode -eq 0) {
 
@@ -1039,7 +1042,7 @@ jobs:
 
       - name: Upload checkpoint 01
         if: ${{ fromJSON(inputs.duration_minutes) >= 45 }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-01
@@ -1062,7 +1065,7 @@ jobs:
 
       - name: Upload checkpoint 02
         if: ${{ fromJSON(inputs.duration_minutes) >= 90 }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-02
@@ -1085,7 +1088,7 @@ jobs:
 
       - name: Upload checkpoint 03
         if: ${{ fromJSON(inputs.duration_minutes) >= 135 }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-03
@@ -1108,7 +1111,7 @@ jobs:
 
       - name: Upload checkpoint 04
         if: ${{ fromJSON(inputs.duration_minutes) >= 180 }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-04
@@ -1131,7 +1134,7 @@ jobs:
 
       - name: Upload checkpoint 05
         if: ${{ fromJSON(inputs.duration_minutes) >= 225 }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-05
@@ -1154,7 +1157,7 @@ jobs:
 
       - name: Upload checkpoint 06
         if: ${{ fromJSON(inputs.duration_minutes) >= 270 }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-06
@@ -1177,7 +1180,7 @@ jobs:
 
       - name: Upload checkpoint 07
         if: ${{ fromJSON(inputs.duration_minutes) >= 315 }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-07
@@ -1233,7 +1236,7 @@ jobs:
       # ============================================================
 
       - name: Upload final checkpoint
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: windows-user-data-checkpoint-final
